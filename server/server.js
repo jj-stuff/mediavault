@@ -1,272 +1,271 @@
+// Optimized Media Server with Caching and FFmpeg Limiting
 import express from 'express';
 import { promises as fs } from 'fs';
 import path from 'path';
 import cors from 'cors';
+import ffmpeg from 'fluent-ffmpeg';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import pLimit from 'p-limit';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const limit = pLimit(3);
 
-// Configure your media directory path here
-const MEDIA_DIR = process.env.MEDIA_DIR || './media';
+const MEDIA_DIR = process.argv[2] || process.env.MEDIA_DIR || '/Users/heathcliff/Documents/xmedia';
+const CACHE_DIR = path.join(MEDIA_DIR, 'media_cache');
+const THUMBNAILS_DIR = path.join(CACHE_DIR, 'thumbnails');
+const SCAN_CACHE_PATH = path.join(CACHE_DIR, 'scan_cache.json');
 
-// Supported media file extensions
+let mediaCache = null;
+
 const MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mp3', '.wav', '.ogg', '.m4a']);
 
-// Middleware
 app.use(cors());
 app.use(express.json());
-
-// Serve static files from media directory
 app.use('/media', express.static(MEDIA_DIR));
+app.use('/thumbnails', express.static(THUMBNAILS_DIR));
 
-// Helper function to check if file is media
-const isMediaFile = (filename) => {
-  const ext = path.extname(filename).toLowerCase();
-  return MEDIA_EXTENSIONS.has(ext);
-};
+const isMediaFile = (filename) => MEDIA_EXTENSIONS.has(path.extname(filename).toLowerCase());
 
-// Recursively scan directory for media files
-async function scanForMedia(dirPath, basePath = '') {
+async function ensureCacheDirectories() {
+  await fs.mkdir(CACHE_DIR, { recursive: true });
+  await fs.mkdir(THUMBNAILS_DIR, { recursive: true });
+}
+
+ensureCacheDirectories();
+
+async function generateThumbnail(videoPath, outputPath) {
+  return limit(
+    () =>
+      new Promise((resolve, reject) => {
+        ffmpeg(videoPath)
+          .screenshots({
+            timestamps: ['10%'],
+            filename: path.basename(outputPath),
+            folder: path.dirname(outputPath),
+            size: '320x320',
+          })
+          .on('end', resolve)
+          .on('error', reject);
+      })
+  );
+}
+
+async function scanForMedia(dirPath, basePath = '', skipThumbnails = false) {
   const mediaFiles = [];
 
   try {
     const items = await fs.readdir(dirPath, { withFileTypes: true });
 
     for (const item of items) {
+      if (item.name === 'media_cache') continue;
       const fullPath = path.join(dirPath, item.name);
       const relativePath = path.join(basePath, item.name);
 
       if (item.isDirectory()) {
-        // Recursively scan subdirectories
-        const subMedia = await scanForMedia(fullPath, relativePath);
+        const subMedia = await scanForMedia(fullPath, relativePath, skipThumbnails);
         mediaFiles.push(...subMedia);
-      } else if (item.isFile() && isMediaFile(item.name)) {
-        // Add media file info
+      } else if (item.isFile() && isMediaFile(item.name) && !item.name.startsWith('._') && !item.name.startsWith('.')) {
         const stats = await fs.stat(fullPath);
-        mediaFiles.push({
+        const type = path.extname(item.name).slice(1).toLowerCase();
+
+        const mediaItem = {
           name: item.name,
           path: relativePath,
           url: `/media/${relativePath.replace(/\\/g, '/')}`,
           size: stats.size,
           modified: stats.mtime,
-          type: path.extname(item.name).slice(1).toLowerCase(),
-        });
+          type,
+        };
+
+        if (!skipThumbnails && ['mp4', 'avi', 'mov', 'webm'].includes(type)) {
+          const videoName = path.basename(fullPath);
+          const thumbnailName = `${path.parse(videoName).name}_thumb.jpg`;
+          const thumbnailPath = path.join(THUMBNAILS_DIR, thumbnailName);
+
+          try {
+            await fs.access(thumbnailPath);
+            mediaItem.thumbnail = `/thumbnails/${thumbnailName}`;
+          } catch {
+            generateThumbnail(fullPath, thumbnailPath).catch((err) => console.error('Thumbnail generation error:', err));
+          }
+        }
+
+        mediaFiles.push(mediaItem);
       }
     }
-  } catch (error) {
-    console.error(`Error scanning directory ${dirPath}:`, error);
+  } catch (err) {
+    console.error(`Error scanning directory ${dirPath}:`, err);
   }
 
   return mediaFiles;
 }
 
-// Get all users (top-level directories)
+async function getCachedMedia() {
+  try {
+    if (mediaCache) return mediaCache;
+    const cachedData = await fs.readFile(SCAN_CACHE_PATH, 'utf8');
+    mediaCache = JSON.parse(cachedData);
+    return mediaCache;
+  } catch (err) {
+    const users = await getUsers();
+    mediaCache = {};
+    for (const user of users) {
+      const userPath = path.join(MEDIA_DIR, user);
+      mediaCache[user] = await scanForMedia(userPath, user);
+    }
+    await fs.writeFile(SCAN_CACHE_PATH, JSON.stringify(mediaCache), 'utf8');
+    return mediaCache;
+  }
+}
+
 async function getUsers() {
   try {
     const items = await fs.readdir(MEDIA_DIR, { withFileTypes: true });
-    return items.filter((item) => item.isDirectory()).map((item) => item.name);
-  } catch (error) {
-    console.error('Error getting users:', error);
+    return items.filter((i) => i.isDirectory() && i.name !== 'media_cache').map((i) => i.name);
+  } catch (err) {
+    console.error('Error reading media dir:', err);
     return [];
   }
 }
 
-// Routes
-
-// Get all users
 app.get('/api/users', async (req, res) => {
-  try {
-    const users = await getUsers();
-    res.json({
-      success: true,
-      count: users.length,
-      users,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve users',
-    });
-  }
+  const users = await getUsers();
+  res.json({ success: true, users });
 });
 
-// Get user profile with avatar
+app.get('/api/users/:username/media', async (req, res) => {
+  const username = req.params.username;
+  const cache = await getCachedMedia();
+  const userMedia = cache[username];
+  if (!userMedia) {
+    return res.status(404).json({ success: false, error: 'User not found' });
+  }
+  res.json({ success: true, count: userMedia.length, media: userMedia });
+});
+
 app.get('/api/users/:username', async (req, res) => {
   const { username } = req.params;
   const userPath = path.join(MEDIA_DIR, username);
-
   try {
     await fs.access(userPath);
-
-    // Get first image as avatar (you can customize this logic)
-    const mediaFiles = await scanForMedia(userPath, username);
+    const cache = await getCachedMedia();
+    const mediaFiles = cache[username] || [];
     const images = mediaFiles.filter((m) => ['jpg', 'jpeg', 'png', 'webp'].includes(m.type));
     const avatar = images.length > 0 ? images[0].url : null;
-
+    const stats = await fs.stat(userPath);
     res.json({
       success: true,
       user: {
         username,
         avatar,
         mediaCount: mediaFiles.length,
-        joinDate: (await fs.stat(userPath)).birthtime,
+        joinDate: stats.birthtime,
       },
     });
   } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: 'User not found',
-    });
+    res.status(404).json({ success: false, error: 'User not found' });
   }
 });
 
-// Get all media for a specific user
-app.get('/api/users/:username/media', async (req, res) => {
-  const { username } = req.params;
-  const userPath = path.join(MEDIA_DIR, username);
-
-  try {
-    // Check if user directory exists
-    await fs.access(userPath);
-
-    // Scan for all media files in user's directory
-    const mediaFiles = await scanForMedia(userPath, username);
-
-    // Group by file type if requested
-    const groupByType = req.query.groupByType === 'true';
-
-    if (groupByType) {
-      const grouped = mediaFiles.reduce((acc, file) => {
-        if (!acc[file.type]) acc[file.type] = [];
-        acc[file.type].push(file);
-        return acc;
-      }, {});
-
-      res.json({
-        success: true,
-        user: username,
-        count: mediaFiles.length,
-        media: grouped,
-      });
-    } else {
-      res.json({
-        success: true,
-        user: username,
-        count: mediaFiles.length,
-        media: mediaFiles,
-      });
-    }
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      res.status(404).json({
-        success: false,
-        error: 'User not found',
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Failed to retrieve media files',
-      });
-    }
-  }
-});
-
-// Get random media from all users (for feed)
 app.get('/api/feed/random', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 10;
-    const mediaType = req.query.type; // 'video', 'image', or undefined for all
-
-    // Get all users
-    const users = await getUsers();
+    const cache = await getCachedMedia();
+    const limitNum = parseInt(req.query.limit) || 10;
+    const mediaType = req.query.type;
     let allMedia = [];
-
-    // Collect all media from all users
-    for (const user of users) {
-      const userPath = path.join(MEDIA_DIR, user);
-      const mediaFiles = await scanForMedia(userPath, user);
-
-      // Add username to each media item
-      mediaFiles.forEach((file) => {
-        file.username = user;
-        file.userUrl = `/api/users/${user}`;
-      });
-
-      allMedia.push(...mediaFiles);
+    for (const [username, mediaList] of Object.entries(cache)) {
+      for (const file of mediaList) {
+        allMedia.push({ ...file, username, userUrl: `/api/users/${username}` });
+      }
     }
-
-    // Filter by type if requested
     if (mediaType === 'video') {
       allMedia = allMedia.filter((m) => ['mp4', 'avi', 'mov', 'webm'].includes(m.type));
     } else if (mediaType === 'image') {
       allMedia = allMedia.filter((m) => ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(m.type));
     }
-
-    // Shuffle and limit
-    const shuffled = allMedia.sort(() => Math.random() - 0.5).slice(0, limit);
-
-    res.json({
-      success: true,
-      count: shuffled.length,
-      media: shuffled,
-    });
+    const shuffled = allMedia.sort(() => Math.random() - 0.5).slice(0, limitNum);
+    res.json({ success: true, count: shuffled.length, media: shuffled });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to generate feed',
-    });
+    console.error('Feed error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate feed' });
   }
 });
 
-// Get summary for all users
 app.get('/api/summary', async (req, res) => {
   try {
-    const users = await getUsers();
+    const cache = await getCachedMedia();
     const summary = {};
-
-    for (const user of users) {
-      const userPath = path.join(MEDIA_DIR, user);
-      const mediaFiles = await scanForMedia(userPath, user);
-
+    for (const [user, mediaList] of Object.entries(cache)) {
       summary[user] = {
-        totalFiles: mediaFiles.length,
-        totalSize: mediaFiles.reduce((sum, file) => sum + file.size, 0),
-        types: mediaFiles.reduce((acc, file) => {
+        totalFiles: mediaList.length,
+        totalSize: mediaList.reduce((sum, file) => sum + file.size, 0),
+        types: mediaList.reduce((acc, file) => {
           acc[file.type] = (acc[file.type] || 0) + 1;
           return acc;
         }, {}),
       };
     }
-
-    res.json({
-      success: true,
-      summary,
-    });
+    res.json({ success: true, summary });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to generate summary',
-    });
+    res.status(500).json({ success: false, error: 'Failed to generate summary' });
   }
 });
 
-// Health check
+app.get('/api/thumbnail/:username/:filename', async (req, res) => {
+  const { username, filename } = req.params;
+  const videoPath = path.join(MEDIA_DIR, username, filename);
+  const thumbnailName = `${path.parse(filename).name}_thumb.jpg`;
+  const thumbnailPath = path.join(THUMBNAILS_DIR, thumbnailName);
+  try {
+    await fs.access(thumbnailPath);
+    res.sendFile(thumbnailPath);
+  } catch {
+    try {
+      await generateThumbnail(videoPath, thumbnailPath);
+      res.sendFile(thumbnailPath);
+    } catch (error) {
+      res.status(500).json({ success: false, error: 'Failed to generate thumbnail' });
+    }
+  }
+});
+// Add this to your server.js
+app.post('/api/deletion-list', express.json(), async (req, res) => {
+  const deletionListPath = path.join(MEDIA_DIR, 'deletion_list.txt');
+  const { paths } = req.body;
+
+  try {
+    await fs.writeFile(deletionListPath, paths.join('\n'), 'utf8');
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/deletion-list', async (req, res) => {
+  const deletionListPath = path.join(MEDIA_DIR, 'deletion_list.txt');
+
+  try {
+    const content = await fs.readFile(deletionListPath, 'utf8');
+    const paths = content.split('\n').filter((p) => p.trim());
+    res.json({ success: true, paths });
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      res.json({ success: true, paths: [] });
+    } else {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', mediaDir: MEDIA_DIR });
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`Media server running on port ${PORT}`);
-  console.log(`Serving media from: ${path.resolve(MEDIA_DIR)}`);
-});
-
-// Error handling
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled rejection:', error);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
-  process.exit(1);
+  console.log(`Server running on port ${PORT}`);
 });

@@ -1,5 +1,7 @@
 import SwiftUI
 import AVKit
+import Foundation
+import Combine
 
 // MARK: - Main App
 @main
@@ -87,6 +89,45 @@ class FavoritesManager: ObservableObject {
     }
 }
 
+// MARK: - Deletion Manager
+class DeletionManager: ObservableObject {
+    static let shared = DeletionManager()
+    @Published var markedForDeletion: Set<String> = []
+    
+    func toggleDeletion(_ item: MediaItem) async {
+        let fullPath = "\(NetworkManager.shared.baseURL.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: ":3000", with: ""))\(item.url)"
+        
+        if markedForDeletion.contains(fullPath) {
+            markedForDeletion.remove(fullPath)
+        } else {
+            markedForDeletion.insert(fullPath)
+        }
+        
+        // Send to server to update deletion list
+        await updateDeletionList()
+    }
+    
+    func isMarkedForDeletion(_ item: MediaItem) -> Bool {
+        let fullPath = "\(NetworkManager.shared.baseURL.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: ":3000", with: ""))\(item.url)"
+        return markedForDeletion.contains(fullPath)
+    }
+    
+    private func updateDeletionList() async {
+        // This would send the list to your server endpoint
+        // For now, just store locally
+        if let encoded = try? JSONEncoder().encode(Array(markedForDeletion)) {
+            UserDefaults.standard.set(encoded, forKey: "MarkedForDeletion")
+        }
+    }
+    
+    func loadDeletionList() {
+        if let data = UserDefaults.standard.data(forKey: "MarkedForDeletion"),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            markedForDeletion = Set(decoded)
+        }
+    }
+}
+
 // MARK: - Network Manager
 class NetworkManager: ObservableObject {
     static let shared = NetworkManager()
@@ -153,10 +194,25 @@ class NetworkManager: ObservableObject {
     
     func fetchUserMedia(username: String, groupByType: Bool = true) async -> [String: [MediaItem]] {
         guard let encodedUsername = username.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let url = URL(string: "\(baseURL)/api/users/\(encodedUsername)/media?groupByType=\(groupByType)") else { return [:] }
+              let url = URL(string: "\(baseURL)/api/users/\(encodedUsername)/media") else { return [:] }
         
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
+            
+            // Try to decode as flat array first (new server format)
+            if let flatResponse = try? JSONDecoder().decode(FlatUserMediaResponse.self, from: data) {
+                // Group the flat array by type
+                var grouped: [String: [MediaItem]] = [:]
+                for item in flatResponse.media {
+                    if grouped[item.type] == nil {
+                        grouped[item.type] = []
+                    }
+                    grouped[item.type]?.append(item)
+                }
+                return grouped
+            }
+            
+            // Fallback to old grouped format
             let response = try JSONDecoder().decode(UserMediaResponse.self, from: data)
             return response.media ?? [:]
         } catch {
@@ -202,15 +258,122 @@ struct UserMediaResponse: Codable {
     let media: [String: [MediaItem]]?
 }
 
+struct FlatUserMediaResponse: Codable {
+    let success: Bool
+    let count: Int
+    let media: [MediaItem]
+}
+
 struct FeedResponse: Codable {
     let success: Bool
     let media: [MediaItem]
 }
 
-// MARK: - Main Content View
+// MARK: - Zoomable Image View
+struct ZoomableImageView: View {
+    let url: String
+    @Binding var aspectMode: ContentMode
+    
+    var body: some View {
+        let backgroundColor: Color = .black
+        
+        ZStack {
+            backgroundColor.ignoresSafeArea()
+            
+            AsyncImage(url: URL(string: url)) { image in
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: aspectMode)
+            } placeholder: {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .black)) //was white
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+
+// MARK: - Cached Image View
+struct CachedAsyncImage: View {
+    let url: URL?
+    let placeholder: () -> AnyView
+    @State private var image: UIImage?
+    @State private var isLoading = false
+    
+    var body: some View {
+        Group {
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else if isLoading {
+                ProgressView()
+            } else {
+                placeholder()
+            }
+        }
+        .onAppear {
+            loadImage()
+        }
+    }
+    
+    private func loadImage() {
+        guard let url = url, image == nil, !isLoading else { return }
+        
+        // Check cache first
+        if let cachedImage = ImageCache.shared.getImage(forKey: url.absoluteString) {
+            self.image = cachedImage
+            return
+        }
+        
+        isLoading = true
+        
+        Task {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                if let downloadedImage = UIImage(data: data) {
+                    await MainActor.run {
+                        self.image = downloadedImage
+                        self.isLoading = false
+                        ImageCache.shared.setImage(downloadedImage, forKey: url.absoluteString)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.isLoading = false
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Simple Image Cache
+class ImageCache {
+    static let shared = ImageCache()
+    private var cache = NSCache<NSString, UIImage>()
+    
+    init() {
+        cache.countLimit = 100 // Limit number of cached images
+        cache.totalCostLimit = 100 * 1024 * 1024 // 100MB limit
+    }
+    
+    func setImage(_ image: UIImage, forKey key: String) {
+        cache.setObject(image, forKey: key as NSString, cost: image.pngData()?.count ?? 0)
+    }
+    
+    func getImage(forKey key: String) -> UIImage? {
+        return cache.object(forKey: key as NSString)
+    }
+    
+    func clearCache() {
+        cache.removeAllObjects()
+    }
+}
 struct ContentView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @StateObject private var favoritesManager = FavoritesManager.shared
+    @StateObject private var deletionManager = DeletionManager.shared
     @State private var selectedTab = 1
     
     var body: some View {
@@ -229,14 +392,25 @@ struct ContentView: View {
                 }
                 .tag(1)
             
+            LikedView()
+                .tabItem {
+                    Image(systemName: "heart.fill")
+                    Text("Liked")
+                }
+                .tag(2)
+            
             SettingsView()
                 .tabItem {
                     Image(systemName: "gearshape.fill")
                     Text("Settings")
                 }
-                .tag(2)
+                .tag(3)
         }
         .environmentObject(favoritesManager)
+        .environmentObject(deletionManager)
+        .onAppear {
+            deletionManager.loadDeletionList()
+        }
     }
 }
 
@@ -256,18 +430,21 @@ struct UsersListView: View {
     var body: some View {
         NavigationStack {
             List(filteredUsers) { user in
-                NavigationLink(destination: UserProfileView(user: user)) {
+                NavigationLink(destination: UserProfileView(user: user)
+                    .environmentObject(FavoritesManager.shared)
+                    .environmentObject(DeletionManager.shared)) {
                     HStack {
-                        // User Avatar
-                        AsyncImage(url: URL(string: user.avatar != nil ? "\(networkManager.baseURL)\(user.avatar!)" : "")) { image in
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                        } placeholder: {
-                            Image(systemName: "person.circle.fill")
-                                .font(.system(size: 40))
-                                .foregroundColor(.gray)
-                        }
+                        // User Avatar with caching
+                        CachedAsyncImage(
+                            url: user.avatar != nil ? URL(string: "\(networkManager.baseURL)\(user.avatar!)") : nil,
+                            placeholder: {
+                                AnyView(
+                                    Image(systemName: "person.circle.fill")
+                                        .font(.system(size: 40))
+                                        .foregroundColor(.gray)
+                                )
+                            }
+                        )
                         .frame(width: 60, height: 60)
                         .clipShape(Circle())
                         
@@ -303,6 +480,8 @@ struct FeedView: View {
     @State private var currentIndex = 0
     @State private var mediaFilter: MediaFilter = .all
     @State private var isLoading = false
+    @State private var visibleIndex: Int? = nil // Track visible item
+    @State private var scrollDebounceTimer: Timer?
     
     enum MediaFilter: String, CaseIterable {
         case all = "All"
@@ -327,16 +506,34 @@ struct FeedView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
                         ForEach(Array(networkManager.feedItems.enumerated()), id: \.element.id) { index, item in
-                            FeedItemView(item: item)
+                            FeedItemView(item: item, isVisible: visibleIndex == index)
                                 .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
                                 .onAppear {
-                                    // Load more when reaching end
-                                    if index == networkManager.feedItems.count - 5 && !isLoading {
+                                    // Debounce scroll to prevent rapid video switching
+                                    scrollDebounceTimer?.invalidate()
+                                    scrollDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { _ in
+                                        visibleIndex = index
+                                    }
+                                    
+                                    // Load more when reaching last 3 items
+                                    if index >= networkManager.feedItems.count - 3 && !isLoading {
                                         Task {
                                             isLoading = true
+                                            let currentCount = networkManager.feedItems.count
                                             await networkManager.fetchRandomFeed(mediaType: mediaFilter.apiValue)
+                                            
+                                            // Append new items instead of replacing
+                                            if networkManager.feedItems.count == currentCount {
+                                                // If no new items, fetch more
+                                                await networkManager.fetchRandomFeed(limit: 50, mediaType: mediaFilter.apiValue)
+                                            }
                                             isLoading = false
                                         }
+                                    }
+                                }
+                                .onDisappear {
+                                    if visibleIndex == index {
+                                        visibleIndex = nil
                                     }
                                 }
                         }
@@ -346,7 +543,7 @@ struct FeedView: View {
                 .ignoresSafeArea()
             }
             
-            // Filter buttons at top
+            // Filter buttons at top with rounded shadow
             VStack {
                 HStack {
                     ForEach(MediaFilter.allCases, id: \.self) { filter in
@@ -358,15 +555,20 @@ struct FeedView: View {
                         }) {
                             Text(filter.rawValue)
                                 .font(.system(size: 14, weight: mediaFilter == filter ? .bold : .medium))
-                                .foregroundColor(mediaFilter == filter ? .black : .gray)
+                                .foregroundColor(mediaFilter == filter ? .black : .white)
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 8)
-                                .background(mediaFilter == filter ? Color.white : Color.white.opacity(0.3))
+                                .background(mediaFilter == filter ? Color.white : Color.black.opacity(0.5))
                                 .cornerRadius(20)
                         }
                     }
                 }
-                .padding(.top, 60)
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(0.4))
+                .cornerRadius(25)
+                .padding(.horizontal)
+                .padding(.top, 55) // Adjusted to be higher but avoid camera island
                 
                 Spacer()
             }
@@ -377,93 +579,227 @@ struct FeedView: View {
     }
 }
 
+// MARK: - Liked View (All favorites across users)
+struct LikedView: View {
+    @StateObject private var networkManager = NetworkManager.shared
+    @EnvironmentObject var favoritesManager: FavoritesManager
+    @State private var allLikedItems: [MediaItem] = []
+    @State private var isLoading = true
+    
+    var body: some View {
+        NavigationStack {
+            if allLikedItems.isEmpty && !isLoading {
+                VStack {
+                    Image(systemName: "heart.slash")
+                        .font(.system(size: 60))
+                        .foregroundColor(.gray)
+                    Text("No liked items yet")
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                ScrollView {
+                    MediaGridView(mediaItems: allLikedItems)
+                        .padding(.top, 8)
+                }
+            }
+        }
+        .navigationTitle("Liked")
+        .task {
+            await loadAllLikedItems()
+        }
+        .onReceive(favoritesManager.$favoriteIDs) { _ in
+            Task {
+                await loadAllLikedItems()
+            }
+        }
+    }
+    
+    private func loadAllLikedItems() async {
+        isLoading = true
+        var allItems: [MediaItem] = []
+        
+        await networkManager.fetchUsers()
+        
+        for user in networkManager.users {
+            let userMedia = await networkManager.fetchUserMedia(username: user.username)
+            for (_, items) in userMedia {
+                for item in items {
+                    if favoritesManager.isFavorite(item) {
+                        allItems.append(item)
+                    }
+                }
+            }
+        }
+        
+        await MainActor.run {
+            self.allLikedItems = allItems
+            self.isLoading = false
+        }
+    }
+}
+
 // MARK: - Feed Item View
 struct FeedItemView: View {
     let item: MediaItem
+    let isVisible: Bool
     @EnvironmentObject var favoritesManager: FavoritesManager
+    @EnvironmentObject var deletionManager: DeletionManager
     @State private var showUserProfile = false
     @State private var player: AVPlayer?
+    @State private var userAvatar: String?
+    @State private var isLandscape = false
+    @AppStorage("skipDuration") private var skipDuration: Double = 5.0
+    
+    // State for image zoom level
+    @State private var aspectMode: ContentMode = .fit
     
     var body: some View {
         ZStack {
-            Color.black
+            Color.black.ignoresSafeArea()
             
             if item.isVideo {
-                VideoPlayerView(url: URL(string: item.fullURL)!, player: $player)
-                    .onAppear {
-                        player?.play()
-                    }
-                    .onDisappear {
-                        player?.pause()
-                    }
-            } else {
-                AsyncImage(url: URL(string: item.fullURL)) { image in
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } placeholder: {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                GeometryReader { geometry in
+                    EnhancedVideoPlayerView(url: URL(string: item.fullURL)!, player: $player, skipDuration: skipDuration, isLandscape: $isLandscape)
+                        .frame(
+                            width: isLandscape ? geometry.size.height : geometry.size.width,
+                            height: isLandscape ? geometry.size.width : geometry.size.height
+                        )
+                        .rotationEffect(.degrees(isLandscape ? 90 : 0))
+                        .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                        .animation(.easeInOut(duration: 0.3), value: isLandscape)
+                        .onAppear {
+                            if isVisible {
+                                player?.play()
+                            }
+                        }
+                        .onDisappear {
+                            player?.pause()
+                            player?.seek(to: .zero)
+                            isLandscape = false // Reset rotation when leaving
+                        }
+                        .onChange(of: isVisible) { _, newValue in
+                            if newValue {
+                                player?.play()
+                            } else {
+                                player?.pause()
+                            }
+                        }
                 }
+                .ignoresSafeArea()
+            } else {
+                // Use the new ZoomableImageView, binding its aspectMode
+                ZoomableImageView(url: item.fullURL, aspectMode: $aspectMode)
             }
             
-            // Side buttons
-            VStack {
-                Spacer()
-                
-                HStack {
+            // Side buttons - hide in landscape
+            if !isLandscape {
+                VStack {
                     Spacer()
                     
-                    VStack(spacing: 20) {
-                        // User profile button
-                        if let username = item.username {
+                    HStack {
+                        Spacer()
+                        
+                        VStack(spacing: 20) {
+                            // User profile button with actual avatar
+                            if let username = item.username {
+                                Button(action: {
+                                    showUserProfile = true
+                                }) {
+                                    if let user = NetworkManager.shared.users.first(where: { $0.username == username }),
+                                       let avatar = user.avatar {
+                                        CachedAsyncImage(
+                                            url: URL(string: "\(NetworkManager.shared.baseURL)\(avatar)"),
+                                            placeholder: {
+                                                AnyView(
+                                                    Image(systemName: "person.circle.fill")
+                                                        .font(.system(size: 44))
+                                                        .foregroundColor(.white)
+                                                )
+                                            }
+                                        )
+                                        .frame(width: 48, height: 48)
+                                        .clipShape(Circle())
+                                        .overlay(Circle().stroke(Color.white, lineWidth: 2))
+                                    } else {
+                                        Image(systemName: "person.circle.fill")
+                                            .font(.system(size: 44))
+                                            .foregroundColor(.white)
+                                    }
+                                }
+                                .shadow(radius: 3)
+                                .sheet(isPresented: $showUserProfile) {
+                                    if let user = NetworkManager.shared.users.first(where: { $0.username == username }) {
+                                        NavigationStack {
+                                            UserProfileView(user: user)
+                                                .environmentObject(favoritesManager)
+                                                .environmentObject(deletionManager)
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Like button
                             Button(action: {
-                                showUserProfile = true
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                    favoritesManager.toggleFavorite(item)
+                                }
                             }) {
-                                VStack(spacing: 4) {
-                                    Image(systemName: "person.circle.fill")
-                                        .font(.system(size: 44))
+                                Image(systemName: favoritesManager.isFavorite(item) ? "heart.fill" : "heart")
+                                    .font(.system(size: 32))
+                                    .foregroundColor(favoritesManager.isFavorite(item) ? .red : .white)
+                                    .scaleEffect(favoritesManager.isFavorite(item) ? 1.2 : 1.0)
+                                    .shadow(radius: 3)
+                            }
+                            
+                            // Rotate button for videos OR Zoom button for images
+                            if item.isVideo {
+                                Button(action: {
+                                    withAnimation {
+                                        isLandscape.toggle()
+                                    }
+                                }) {
+                                    Image(systemName: isLandscape ? "rotate.left" : "rotate.right")
+                                        .font(.system(size: 28))
+                                        .foregroundColor(.white)
+                                        .shadow(radius: 3)
+                                        .padding(8)
+                                        .background(isLandscape ? Color.white.opacity(0.2) : Color.clear)
+                                        .clipShape(Circle())
+                                }
+                            } else {
+                                // Zoom button for images, placed with other controls
+                                Button(action: {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        aspectMode = (aspectMode == .fit) ? .fill : .fit
+                                    }
+                                }) {
+                                    Image(systemName: aspectMode == .fit ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+                                        .font(.system(size: 28))
                                         .foregroundColor(.white)
                                         .shadow(radius: 3)
                                 }
                             }
-                            .sheet(isPresented: $showUserProfile) {
-                                if let user = NetworkManager.shared.users.first(where: { $0.username == username }) {
-                                    NavigationStack {
-                                        UserProfileView(user: user)
-                                    }
+                            
+                            // Delete mark button
+                            Button(action: {
+                                Task {
+                                    await deletionManager.toggleDeletion(item)
                                 }
+                            }) {
+                                Image(systemName: deletionManager.isMarkedForDeletion(item) ? "trash.fill" : "trash")
+                                    .font(.system(size: 28))
+                                    .foregroundColor(deletionManager.isMarkedForDeletion(item) ? .red : .white)
+                                    .shadow(radius: 3)
                             }
                         }
-                        
-                        // Like button
-                        Button(action: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                                favoritesManager.toggleFavorite(item)
-                            }
-                        }) {
-                            Image(systemName: favoritesManager.isFavorite(item) ? "heart.fill" : "heart")
-                                .font(.system(size: 32))
-                                .foregroundColor(favoritesManager.isFavorite(item) ? .red : .white)
-                                .scaleEffect(favoritesManager.isFavorite(item) ? 1.2 : 1.0)
-                                .shadow(radius: 3)
-                        }
-                        
-                        // Bookmark button
-                        Button(action: {}) {
-                            Image(systemName: "bookmark")
-                                .font(.system(size: 28))
-                                .foregroundColor(.white)
-                                .shadow(radius: 3)
-                        }
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 160) // Adjusted for new progress bar position
                     }
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 100)
                 }
             }
             
-            // Username at bottom
-            if let username = item.username {
+            // Username at bottom (adjusted to not overlap progress bar) - hide in landscape
+            if let username = item.username, !isLandscape {
                 VStack {
                     Spacer()
                     HStack {
@@ -471,29 +807,108 @@ struct FeedItemView: View {
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.white)
                             .shadow(radius: 3)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.black.opacity(0.5))
+                            .cornerRadius(8)
                         Spacer()
                     }
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 60)
+                    .padding(.bottom, 140) // Adjusted for new progress bar position
                 }
             }
         }
     }
 }
 
-// MARK: - Video Player View (Fixed aspect ratio)
-struct VideoPlayerView: UIViewControllerRepresentable {
+// MARK: - Enhanced Video Player View with Progress Bar and Double Tap
+struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
     let url: URL
     @Binding var player: AVPlayer?
+    let skipDuration: Double
+    @Binding var isLandscape: Bool
     
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let controller = AVPlayerViewController()
+    func makeUIViewController(context: Context) -> UIViewController {
+        let container = UIViewController()
+        container.view.backgroundColor = .black // Black background for letterboxing
+        
+        // Create player
         let player = AVPlayer(url: url)
         player.automaticallyWaitsToMinimizeStalling = false
         player.volume = 1.0
-        controller.player = player
-        controller.showsPlaybackControls = false
-        controller.videoGravity = .resizeAspect // Ensures video fits without stretching
+        
+        // Create player view controller
+        let playerViewController = AVPlayerViewController()
+        playerViewController.player = player
+        playerViewController.showsPlaybackControls = false
+        playerViewController.videoGravity = isLandscape ? .resizeAspectFill : .resizeAspect
+        
+        // Add as child
+        container.addChild(playerViewController)
+        container.view.addSubview(playerViewController.view)
+        playerViewController.view.translatesAutoresizingMaskIntoConstraints = false
+        
+        NSLayoutConstraint.activate([
+            playerViewController.view.topAnchor.constraint(equalTo: container.view.topAnchor),
+            playerViewController.view.leadingAnchor.constraint(equalTo: container.view.leadingAnchor),
+            playerViewController.view.trailingAnchor.constraint(equalTo: container.view.trailingAnchor),
+            playerViewController.view.bottomAnchor.constraint(equalTo: container.view.bottomAnchor)
+        ])
+        
+        playerViewController.didMove(toParent: container)
+        
+        // Add single tap for play/pause
+        let singleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleSingleTap))
+        playerViewController.view.addGestureRecognizer(singleTap)
+        
+        // Create custom controls overlay
+        let controlsView = VideoControlsView(player: player, skipDuration: skipDuration)
+        controlsView.isHidden = isLandscape
+        container.view.addSubview(controlsView)
+        controlsView.translatesAutoresizingMaskIntoConstraints = false
+        
+        NSLayoutConstraint.activate([
+            controlsView.leadingAnchor.constraint(equalTo: container.view.leadingAnchor),
+            controlsView.trailingAnchor.constraint(equalTo: container.view.trailingAnchor),
+            controlsView.bottomAnchor.constraint(equalTo: container.view.bottomAnchor, constant: -60),
+            controlsView.heightAnchor.constraint(equalToConstant: 70) // Increased for better touch area
+        ])
+        
+        context.coordinator.controlsView = controlsView
+        context.coordinator.playerViewController = playerViewController
+        
+        // Add gesture recognizers for double tap
+        let leftDoubleTap = UITapGestureRecognizer(target: controlsView, action: #selector(VideoControlsView.leftDoubleTapped))
+        leftDoubleTap.numberOfTapsRequired = 2
+        leftDoubleTap.require(toFail: singleTap)
+        
+        let rightDoubleTap = UITapGestureRecognizer(target: controlsView, action: #selector(VideoControlsView.rightDoubleTapped))
+        rightDoubleTap.numberOfTapsRequired = 2
+        rightDoubleTap.require(toFail: singleTap)
+        
+        // Create left and right tap areas
+        let leftTapView = UIView()
+        leftTapView.translatesAutoresizingMaskIntoConstraints = false
+        container.view.addSubview(leftTapView)
+        
+        let rightTapView = UIView()
+        rightTapView.translatesAutoresizingMaskIntoConstraints = false
+        container.view.addSubview(rightTapView)
+        
+        NSLayoutConstraint.activate([
+            leftTapView.leadingAnchor.constraint(equalTo: container.view.leadingAnchor),
+            leftTapView.topAnchor.constraint(equalTo: container.view.topAnchor),
+            leftTapView.bottomAnchor.constraint(equalTo: container.view.bottomAnchor),
+            leftTapView.widthAnchor.constraint(equalTo: container.view.widthAnchor, multiplier: 0.3),
+            
+            rightTapView.trailingAnchor.constraint(equalTo: container.view.trailingAnchor),
+            rightTapView.topAnchor.constraint(equalTo: container.view.topAnchor),
+            rightTapView.bottomAnchor.constraint(equalTo: container.view.bottomAnchor),
+            rightTapView.widthAnchor.constraint(equalTo: container.view.widthAnchor, multiplier: 0.3)
+        ])
+        
+        leftTapView.addGestureRecognizer(leftDoubleTap)
+        rightTapView.addGestureRecognizer(rightDoubleTap)
         
         // Auto loop
         NotificationCenter.default.addObserver(
@@ -509,10 +924,207 @@ struct VideoPlayerView: UIViewControllerRepresentable {
             self.player = player
         }
         
-        return controller
+        return container
     }
     
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+        if let playerViewController = context.coordinator.playerViewController {
+            playerViewController.videoGravity = isLandscape ? .resizeAspectFill : .resizeAspect
+        }
+        context.coordinator.controlsView?.isHidden = isLandscape
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(player: $player)
+    }
+    
+    class Coordinator: NSObject {
+        var player: Binding<AVPlayer?>
+        var controlsView: VideoControlsView?
+        var playerViewController: AVPlayerViewController?
+        
+        init(player: Binding<AVPlayer?>) {
+            self.player = player
+        }
+        
+        @objc func handleSingleTap() {
+            if let player = player.wrappedValue {
+                if player.rate == 0 {
+                    player.play()
+                } else {
+                    player.pause()
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Video Controls View
+class VideoControlsView: UIView {
+    let player: AVPlayer
+    private let skipDuration: Double
+    private var progressSlider: UISlider!
+    private var timeLabel: UILabel!
+    private var timeObserver: Any?
+    private var isScrubbing = false
+    
+    init(player: AVPlayer, skipDuration: Double) {
+        self.player = player
+        self.skipDuration = skipDuration
+        super.init(frame: .zero)
+        setupUI()
+        startTimeObserver()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    deinit {
+        if let observer = timeObserver {
+            player.removeTimeObserver(observer)
+        }
+    }
+    
+    private func setupUI() {
+        backgroundColor = UIColor.black.withAlphaComponent(0.2)
+        layer.cornerRadius = 8
+        
+        // Create a larger touch area container for the slider
+        let sliderContainer = UIView()
+        sliderContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(sliderContainer)
+        
+        // Progress slider
+        progressSlider = UISlider()
+        progressSlider.minimumTrackTintColor = .white
+        progressSlider.maximumTrackTintColor = UIColor.white.withAlphaComponent(0.3)
+        progressSlider.thumbTintColor = .white
+        progressSlider.translatesAutoresizingMaskIntoConstraints = false
+        progressSlider.addTarget(self, action: #selector(sliderValueChanged), for: .valueChanged)
+        progressSlider.addTarget(self, action: #selector(sliderTouchBegan), for: .touchDown)
+        progressSlider.addTarget(self, action: #selector(sliderTouchEnded), for: [.touchUpInside, .touchUpOutside])
+        sliderContainer.addSubview(progressSlider)
+        
+        // Time label
+        timeLabel = UILabel()
+        timeLabel.textColor = .white
+        timeLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        timeLabel.text = " 0:00 / 0:00 "
+        timeLabel.textAlignment = .center
+        timeLabel.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        timeLabel.layer.cornerRadius = 4
+        timeLabel.clipsToBounds = true
+        timeLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(timeLabel)
+        
+        NSLayoutConstraint.activate([
+            // Slider container fills most of the view
+            sliderContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            sliderContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            sliderContainer.topAnchor.constraint(equalTo: topAnchor),
+            sliderContainer.heightAnchor.constraint(equalToConstant: 44), // Larger touch area
+            
+            // Actual slider centered in container
+            progressSlider.leadingAnchor.constraint(equalTo: sliderContainer.leadingAnchor, constant: 16),
+            progressSlider.trailingAnchor.constraint(equalTo: sliderContainer.trailingAnchor, constant: -16),
+            progressSlider.centerYAnchor.constraint(equalTo: sliderContainer.centerYAnchor),
+            
+            timeLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            timeLabel.topAnchor.constraint(equalTo: sliderContainer.bottomAnchor, constant: 4),
+            timeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 100),
+            timeLabel.heightAnchor.constraint(equalToConstant: 20)
+        ])
+    }
+    
+    @objc private func sliderTouchBegan() {
+        isScrubbing = true
+        player.pause()
+    }
+    
+    @objc private func sliderTouchEnded() {
+        isScrubbing = false
+        player.play()
+    }
+    
+    @objc private func sliderValueChanged(_ slider: UISlider) {
+        if let duration = player.currentItem?.duration.seconds, duration.isFinite {
+            let time = duration * Double(slider.value)
+            player.seek(to: CMTime(seconds: time, preferredTimescale: 1))
+            timeLabel.text = " \(formatTime(time)) / \(formatTime(duration)) "
+        }
+    }
+    
+    @objc func leftDoubleTapped() {
+        let currentTime = player.currentTime()
+        let newTime = CMTimeSubtract(currentTime, CMTime(seconds: skipDuration, preferredTimescale: 1))
+        player.seek(to: newTime)
+        
+        // Show skip indicator
+        showSkipIndicator(forward: false)
+    }
+    
+    @objc func rightDoubleTapped() {
+        let currentTime = player.currentTime()
+        let newTime = CMTimeAdd(currentTime, CMTime(seconds: skipDuration, preferredTimescale: 1))
+        player.seek(to: newTime)
+        
+        // Show skip indicator
+        showSkipIndicator(forward: true)
+    }
+    
+    private func showSkipIndicator(forward: Bool) {
+        guard let superview = superview else { return }
+        
+        let label = UILabel()
+        label.text = forward ? " +\(Int(skipDuration))s " : " -\(Int(skipDuration))s "
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 32, weight: .heavy)
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        label.layer.cornerRadius = 10
+        label.clipsToBounds = true
+        label.textAlignment = .center
+        label.layer.borderWidth = 2
+        label.layer.borderColor = UIColor.white.cgColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        
+        superview.addSubview(label)
+        
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: superview.centerXAnchor, constant: forward ? 100 : -100),
+            label.centerYAnchor.constraint(equalTo: superview.centerYAnchor, constant: -50),
+            label.widthAnchor.constraint(equalToConstant: 120),
+            label.heightAnchor.constraint(equalToConstant: 60)
+        ])
+        
+        UIView.animate(withDuration: 0.3, delay: 0.5, options: .curveEaseOut) {
+            label.alpha = 0
+        } completion: { _ in
+            label.removeFromSuperview()
+        }
+    }
+    
+    private func startTimeObserver() {
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 10)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, !self.isScrubbing else { return }
+            
+            let currentSeconds = time.seconds
+            let duration = self.player.currentItem?.duration.seconds ?? 0
+            
+            if duration.isFinite && duration > 0 {
+                self.progressSlider.value = Float(currentSeconds / duration)
+                self.timeLabel.text = " \(self.formatTime(currentSeconds)) / \(self.formatTime(duration)) "
+            }
+        }
+    }
+    
+    private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite else { return "0:00" }
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return String(format: "%d:%02d", mins, secs)
+    }
 }
 
 // MARK: - User Profile View
@@ -533,15 +1145,16 @@ struct UserProfileView: View {
                         // Profile Header (scrolls away)
                         GeometryReader { geo in
                             VStack(spacing: 16) {
-                                AsyncImage(url: URL(string: user.avatar != nil ? "\(NetworkManager.shared.baseURL)\(user.avatar!)" : "")) { image in
-                                    image
-                                        .resizable()
-                                        .aspectRatio(contentMode: .fill)
-                                } placeholder: {
-                                    Image(systemName: "person.circle.fill")
-                                        .font(.system(size: 80))
-                                        .foregroundColor(.gray)
-                                }
+                                CachedAsyncImage(
+                                    url: user.avatar != nil ? URL(string: "\(NetworkManager.shared.baseURL)\(user.avatar!)") : nil,
+                                    placeholder: {
+                                        AnyView(
+                                            Image(systemName: "person.circle.fill")
+                                                .font(.system(size: 80))
+                                                .foregroundColor(.gray)
+                                        )
+                                    }
+                                )
                                 .frame(width: 100, height: 100)
                                 .clipShape(Circle())
                                 
@@ -709,6 +1322,8 @@ struct MediaThumbnailView: View {
         }
         .fullScreenCover(isPresented: $showFullScreen) {
             MediaGalleryView(items: allItems, startIndex: currentIndex)
+                .environmentObject(FavoritesManager.shared)
+                .environmentObject(DeletionManager.shared)
         }
     }
     
@@ -739,105 +1354,179 @@ struct MediaGalleryView: View {
     let startIndex: Int
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var favoritesManager: FavoritesManager
+    @EnvironmentObject var deletionManager: DeletionManager
     @State private var currentIndex: Int
     @State private var players: [Int: AVPlayer] = [:]
-    
+    @State private var aspectModes: [Int: ContentMode] = [:] // Track aspect modes per image
+    @State private var isLandscape = false
+    @AppStorage("skipDuration") private var skipDuration: Double = 5.0
+
     init(items: [MediaItem], startIndex: Int) {
         self.items = items
         self.startIndex = startIndex
         self._currentIndex = State(initialValue: startIndex)
     }
-    
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            
+
+            // Main swipeable media view
             TabView(selection: $currentIndex) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     ZStack {
                         if item.isVideo {
-                            VideoPlayerView(url: URL(string: item.fullURL)!, player: binding(for: index))
-                                .onAppear {
-                                    players[index]?.play()
-                                }
-                                .onDisappear {
-                                    players[index]?.pause()
-                                }
-                        } else {
-                            AsyncImage(url: URL(string: item.fullURL)) { image in
-                                image
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                            } placeholder: {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            GeometryReader { geometry in
+                                EnhancedVideoPlayerView(
+                                    url: URL(string: item.fullURL)!,
+                                    player: bindingForPlayer(at: index),
+                                    skipDuration: skipDuration,
+                                    isLandscape: $isLandscape
+                                )
+                                .frame(
+                                    width: isLandscape ? geometry.size.height : geometry.size.width,
+                                    height: isLandscape ? geometry.size.width : geometry.size.height
+                                )
+                                .rotationEffect(.degrees(isLandscape ? 90 : 0))
+                                .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                                .animation(.easeInOut(duration: 0.3), value: isLandscape)
+                                .onAppear { players[index]?.play() }
+                                .onDisappear { players[index]?.pause() }
                             }
+                        } else {
+                            // FIX: Use the new ZoomableImageView with a binding to the gallery's state
+                            ZoomableImageView(
+                                url: item.fullURL,
+                                aspectMode: bindingForAspectMode(at: index)
+                            )
                         }
                     }
                     .tag(index)
                 }
             }
-            .tabViewStyle(PageTabViewStyle())
+            .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
             .ignoresSafeArea()
-            
-            // Top controls
-            VStack {
-                HStack {
-                    Button("Done") {
-                        dismiss()
-                    }
-                    .foregroundColor(.white)
-                    .padding()
-                    
-                    Spacer()
-                    
-                    // Like button
-                    if currentIndex < items.count {
-                        Button(action: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                                favoritesManager.toggleFavorite(items[currentIndex])
+
+            // Top controls - hide in landscape
+            if !isLandscape {
+                VStack {
+                    HStack {
+                        Button("Done") {
+                            dismiss()
+                        }
+                        .foregroundColor(.white)
+                        .padding()
+
+                        Spacer()
+
+                        if currentIndex < items.count {
+                            HStack(spacing: 20) {
+                                // Rotate button for videos
+                                if items[currentIndex].isVideo {
+                                    Button(action: {
+                                        withAnimation {
+                                            isLandscape.toggle()
+                                        }
+                                    }) {
+                                        Image(systemName: isLandscape ? "rotate.left" : "rotate.right")
+                                            .font(.system(size: 24))
+                                            .foregroundColor(.white)
+                                    }
+                                }
+                                
+                                // Trash
+                                Button(action: {
+                                    Task {
+                                        await deletionManager.toggleDeletion(items[currentIndex])
+                                    }
+                                }) {
+                                    Image(systemName: deletionManager.isMarkedForDeletion(items[currentIndex]) ? "trash.fill" : "trash")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(deletionManager.isMarkedForDeletion(items[currentIndex]) ? .red : .white)
+                                }
+
+                                // Like
+                                Button(action: {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                        favoritesManager.toggleFavorite(items[currentIndex])
+                                    }
+                                }) {
+                                    Image(systemName: favoritesManager.isFavorite(items[currentIndex]) ? "heart.fill" : "heart")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(favoritesManager.isFavorite(items[currentIndex]) ? .red : .white)
+                                }
                             }
-                        }) {
-                            Image(systemName: favoritesManager.isFavorite(items[currentIndex]) ? "heart.fill" : "heart")
-                                .font(.system(size: 24))
-                                .foregroundColor(favoritesManager.isFavorite(items[currentIndex]) ? .red : .white)
-                                .padding()
+                            .padding()
                         }
                     }
+
+                    Spacer()
+
+                    // Page indicator
+                    Text("\(currentIndex + 1) / \(items.count)")
+                        .foregroundColor(.white)
+                        .padding()
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(20)
+                        .padding(.bottom)
                 }
-                
-                Spacer()
-                
-                // Page indicator
-                Text("\(currentIndex + 1) / \(items.count)")
-                    .foregroundColor(.white)
-                    .padding()
-                    .background(Color.black.opacity(0.6))
-                    .cornerRadius(20)
-                    .padding(.bottom)
+            }
+
+            // Floating toggle button for images (bottom left) - hide in landscape
+            if currentIndex < items.count && !items[currentIndex].isVideo && !isLandscape {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                let currentMode = aspectModes[currentIndex, default: .fit]
+                                aspectModes[currentIndex] = (currentMode == .fit) ? .fill : .fit
+                            }
+                        }) {
+                            let currentMode = aspectModes[currentIndex, default: .fit]
+                            Image(systemName: currentMode == .fit ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+                                .font(.system(size: 20))
+                                .foregroundColor(.white)
+                                .padding(10)
+                                .background(Color.black.opacity(0.6))
+                                .clipShape(Circle())
+                        }
+                        .padding(.leading, 20)
+                        .padding(.bottom, 60) // Safe for bottom nav
+                        Spacer()
+                    }
+                }
             }
         }
         .onChange(of: currentIndex) { oldValue, newValue in
-            // Pause old video
             players[oldValue]?.pause()
-            // Play new video
             players[newValue]?.play()
+            isLandscape = false // Reset rotation when changing items
         }
     }
-    
-    func binding(for index: Int) -> Binding<AVPlayer?> {
+
+    private func bindingForPlayer(at index: Int) -> Binding<AVPlayer?> {
         Binding(
             get: { players[index] },
             set: { players[index] = $0 }
         )
     }
+
+    private func bindingForAspectMode(at index: Int) -> Binding<ContentMode> {
+        Binding<ContentMode>(
+            get: { aspectModes[index, default: .fit] },
+            set: { aspectModes[index] = $0 }
+        )
+    }
 }
 
-// MARK: - Settings View (with editable server URL)
+
+// MARK: - Settings View (with skip duration)
 struct SettingsView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @State private var serverURL: String = ""
     @State private var showingAlert = false
+    @AppStorage("skipDuration") private var skipDuration: Double = 5.0
     
     var body: some View {
         NavigationStack {
@@ -868,17 +1557,42 @@ struct SettingsView: View {
                     }
                 }
                 
+                Section("Video Controls") {
+                    HStack {
+                        Text("Skip Duration")
+                        Spacer()
+                        Picker("Skip Duration", selection: $skipDuration) {
+                            Text("5 seconds").tag(5.0)
+                            Text("10 seconds").tag(10.0)
+                            Text("15 seconds").tag(15.0)
+                            Text("30 seconds").tag(30.0)
+                        }
+                        .pickerStyle(MenuPickerStyle())
+                    }
+                }
+                
                 Section("Cache") {
                     Button("Clear Image Cache") {
                         URLCache.shared.removeAllCachedResponses()
+                        ImageCache.shared.clearCache()
                     }
+                    
+                    Button("Clear All Caches") {
+                        URLCache.shared.removeAllCachedResponses()
+                        ImageCache.shared.clearCache()
+                        // Clear user defaults cache
+                        if let bundleID = Bundle.main.bundleIdentifier {
+                            UserDefaults.standard.removePersistentDomain(forName: bundleID)
+                        }
+                    }
+                    .foregroundColor(.red)
                 }
                 
                 Section("About") {
                     HStack {
                         Text("Version")
                         Spacer()
-                        Text("1.0.1")
+                        Text("1.1.0")
                             .foregroundColor(.secondary)
                     }
                 }
