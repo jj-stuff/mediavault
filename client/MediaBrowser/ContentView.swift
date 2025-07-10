@@ -9,6 +9,7 @@ struct MediaBrowserApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .preferredColorScheme(.dark) // Better for media viewing
         }
     }
 }
@@ -25,17 +26,24 @@ struct User: Identifiable, Codable {
     }
 }
 
-struct MediaItem: Identifiable, Codable {
+struct MediaItem: Identifiable, Codable, Equatable {
     let id = UUID()
     let name: String
     let path: String
     let url: String
+    let fullPath: String? // Server now provides full system path
     let size: Int
     let type: String
     let username: String?
+    let thumbnail: String?
     
     var fullURL: String {
         return "\(NetworkManager.shared.baseURL)\(url)"
+    }
+    
+    var thumbnailURL: String? {
+        guard let thumbnail = thumbnail else { return nil }
+        return "\(NetworkManager.shared.baseURL)\(thumbnail)"
     }
     
     var isVideo: Bool {
@@ -43,11 +51,42 @@ struct MediaItem: Identifiable, Codable {
     }
     
     var uniqueID: String {
-        return "\(username ?? "unknown")_\(name)"
+        return "\(username ?? "unknown")_\(path)"
+    }
+    
+    static func == (lhs: MediaItem, rhs: MediaItem) -> Bool {
+        return lhs.uniqueID == rhs.uniqueID
     }
     
     enum CodingKeys: String, CodingKey {
-        case name, path, url, size, type, username
+        case name, path, url, fullPath, size, type, username, thumbnail
+    }
+}
+
+// MARK: - Server Settings
+struct ServerSettings: Codable {
+    var scheme: String = "http"
+    var host: String = "192.168.1.123"
+    var port: String = "3000"
+    
+    var fullURL: String {
+        return "\(scheme)://\(host):\(port)"
+    }
+    
+    static let storageKey = "ServerSettings"
+    
+    static func load() -> ServerSettings {
+        if let data = UserDefaults.standard.data(forKey: storageKey),
+           let settings = try? JSONDecoder().decode(ServerSettings.self, from: data) {
+            return settings
+        }
+        return ServerSettings()
+    }
+    
+    func save() {
+        if let encoded = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(encoded, forKey: ServerSettings.storageKey)
+        }
     }
 }
 
@@ -57,31 +96,40 @@ class FavoritesManager: ObservableObject {
     @Published var favoriteIDs: Set<String> = []
     
     private let favoritesKey = "UserFavorites"
+    private let queue = DispatchQueue(label: "favorites.queue", attributes: .concurrent)
     
     init() {
         loadFavorites()
     }
     
     func loadFavorites() {
-        if let data = UserDefaults.standard.data(forKey: favoritesKey),
-           let decoded = try? JSONDecoder().decode(Set<String>.self, from: data) {
-            favoriteIDs = decoded
+        queue.async(flags: .barrier) { [weak self] in
+            if let data = UserDefaults.standard.data(forKey: self?.favoritesKey ?? ""),
+               let decoded = try? JSONDecoder().decode(Set<String>.self, from: data) {
+                DispatchQueue.main.async {
+                    self?.favoriteIDs = decoded
+                }
+            }
         }
     }
     
     func saveFavorites() {
-        if let encoded = try? JSONEncoder().encode(favoriteIDs) {
-            UserDefaults.standard.set(encoded, forKey: favoritesKey)
+        queue.async(flags: .barrier) { [weak self] in
+            if let encoded = try? JSONEncoder().encode(self?.favoriteIDs) {
+                UserDefaults.standard.set(encoded, forKey: self?.favoritesKey ?? "")
+            }
         }
     }
     
     func toggleFavorite(_ item: MediaItem) {
-        if favoriteIDs.contains(item.uniqueID) {
-            favoriteIDs.remove(item.uniqueID)
-        } else {
-            favoriteIDs.insert(item.uniqueID)
+        DispatchQueue.main.async { [weak self] in
+            if self?.favoriteIDs.contains(item.uniqueID) == true {
+                self?.favoriteIDs.remove(item.uniqueID)
+            } else {
+                self?.favoriteIDs.insert(item.uniqueID)
+            }
+            self?.saveFavorites()
         }
-        saveFavorites()
     }
     
     func isFavorite(_ item: MediaItem) -> Bool {
@@ -93,56 +141,128 @@ class FavoritesManager: ObservableObject {
 class DeletionManager: ObservableObject {
     static let shared = DeletionManager()
     @Published var markedForDeletion: Set<String> = []
+    @Published var isUpdating = false
+    
+    private let queue = DispatchQueue(label: "deletion.queue")
     
     func toggleDeletion(_ item: MediaItem) async {
-        let fullPath = "\(NetworkManager.shared.baseURL.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: ":3000", with: ""))\(item.url)"
+        // Use the full system path provided by server
+        let pathToUse = item.fullPath ?? item.url
         
-        if markedForDeletion.contains(fullPath) {
-            markedForDeletion.remove(fullPath)
-        } else {
-            markedForDeletion.insert(fullPath)
+        await MainActor.run {
+            self.isUpdating = true
         }
         
-        // Send to server to update deletion list
-        await updateDeletionList()
+        do {
+            if markedForDeletion.contains(pathToUse) {
+                // Remove from deletion list
+                try await removeFromDeletionList(pathToUse)
+                await MainActor.run {
+                    self.markedForDeletion.remove(pathToUse)
+                }
+            } else {
+                // Add to deletion list
+                try await addToDeletionList(pathToUse)
+                await MainActor.run {
+                    self.markedForDeletion.insert(pathToUse)
+                }
+            }
+        } catch {
+            print("Error updating deletion list: \(error)")
+        }
+        
+        await MainActor.run {
+            self.isUpdating = false
+        }
     }
     
     func isMarkedForDeletion(_ item: MediaItem) -> Bool {
-        let fullPath = "\(NetworkManager.shared.baseURL.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: ":3000", with: ""))\(item.url)"
-        return markedForDeletion.contains(fullPath)
+        let pathToCheck = item.fullPath ?? item.url
+        return markedForDeletion.contains(pathToCheck)
     }
     
-    private func updateDeletionList() async {
-        // This would send the list to your server endpoint
-        // For now, just store locally
-        if let encoded = try? JSONEncoder().encode(Array(markedForDeletion)) {
-            UserDefaults.standard.set(encoded, forKey: "MarkedForDeletion")
+    private func addToDeletionList(_ path: String) async throws {
+        let url = URL(string: "\(NetworkManager.shared.baseURL)/api/deletion-list/add")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["path": path])
+        
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw URLError(.badServerResponse)
         }
     }
     
-    func loadDeletionList() {
-        if let data = UserDefaults.standard.data(forKey: "MarkedForDeletion"),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            markedForDeletion = Set(decoded)
+    private func removeFromDeletionList(_ path: String) async throws {
+        let url = URL(string: "\(NetworkManager.shared.baseURL)/api/deletion-list/remove")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["path": path])
+        
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw URLError(.badServerResponse)
         }
     }
+    
+    func loadDeletionList() async {
+        guard let url = URL(string: "\(NetworkManager.shared.baseURL)/api/deletion-list") else { return }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(DeletionListResponse.self, from: data)
+            
+            await MainActor.run {
+                self.markedForDeletion = Set(response.paths)
+            }
+        } catch {
+            print("Error loading deletion list: \(error)")
+        }
+    }
+}
+
+struct DeletionListResponse: Codable {
+    let success: Bool
+    let paths: [String]
+    let count: Int
+    let location: String?
 }
 
 // MARK: - Network Manager
 class NetworkManager: ObservableObject {
     static let shared = NetworkManager()
-    @Published var baseURL: String {
+    
+    @Published var serverSettings: ServerSettings {
         didSet {
-            UserDefaults.standard.set(baseURL, forKey: "ServerURL")
+            serverSettings.save()
         }
+    }
+    
+    var baseURL: String {
+        return serverSettings.fullURL
     }
     
     @Published var users: [User] = []
     @Published var feedItems: [MediaItem] = []
     @Published var isLoading = false
     
+    private var etag: String?
+    private let session: URLSession
+    
     init() {
-        self.baseURL = UserDefaults.standard.string(forKey: "ServerURL") ?? "http://192.168.1.123:3000"
+        self.serverSettings = ServerSettings.load()
+        
+        // Configure URLSession with optimized settings
+        let configuration = URLSessionConfiguration.default
+        configuration.requestCachePolicy = .returnCacheDataElseLoad
+        configuration.timeoutIntervalForRequest = 30
+        configuration.httpMaximumConnectionsPerHost = 10
+        
+        self.session = URLSession(configuration: configuration)
     }
     
     func fetchUsers() async {
@@ -159,15 +279,24 @@ class NetworkManager: ObservableObject {
         guard let url = URL(string: urlString) else { return }
         
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await session.data(from: url)
             let decodedResponse = try JSONDecoder().decode(UsersResponse.self, from: data)
             
-            // Fetch user details for each user
-            var userDetails: [User] = []
-            for username in decodedResponse.users {
-                if let user = await fetchUserProfile(username: username) {
-                    userDetails.append(user)
+            // Fetch user details concurrently
+            let userDetails = await withTaskGroup(of: User?.self) { group in
+                for username in decodedResponse.users {
+                    group.addTask { [weak self] in
+                        await self?.fetchUserProfile(username: username)
+                    }
                 }
+                
+                var users: [User] = []
+                for await user in group {
+                    if let user = user {
+                        users.append(user)
+                    }
+                }
+                return users.sorted { $0.username < $1.username }
             }
             
             await MainActor.run {
@@ -183,7 +312,7 @@ class NetworkManager: ObservableObject {
               let url = URL(string: "\(baseURL)/api/users/\(encodedUsername)") else { return nil }
         
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await session.data(from: url)
             let profileResponse = try JSONDecoder().decode(UserProfileResponse.self, from: data)
             return profileResponse.user
         } catch {
@@ -192,29 +321,41 @@ class NetworkManager: ObservableObject {
         }
     }
     
-    func fetchUserMedia(username: String, groupByType: Bool = true) async -> [String: [MediaItem]] {
+    func fetchUserMedia(username: String) async -> [String: [MediaItem]] {
         guard let encodedUsername = username.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "\(baseURL)/api/users/\(encodedUsername)/media") else { return [:] }
         
+        var request = URLRequest(url: url)
+        if let etag = self.etag {
+            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        }
+        
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await session.data(for: request)
             
-            // Try to decode as flat array first (new server format)
-            if let flatResponse = try? JSONDecoder().decode(FlatUserMediaResponse.self, from: data) {
-                // Group the flat array by type
-                var grouped: [String: [MediaItem]] = [:]
-                for item in flatResponse.media {
-                    if grouped[item.type] == nil {
-                        grouped[item.type] = []
-                    }
-                    grouped[item.type]?.append(item)
+            if let httpResponse = response as? HTTPURLResponse {
+                if httpResponse.statusCode == 304 {
+                    // Not modified, use cached data
+                    return [:]
                 }
-                return grouped
+                
+                // Store ETag for future requests
+                if let newEtag = httpResponse.value(forHTTPHeaderField: "ETag") {
+                    self.etag = newEtag
+                }
             }
             
-            // Fallback to old grouped format
-            let response = try JSONDecoder().decode(UserMediaResponse.self, from: data)
-            return response.media ?? [:]
+            let flatResponse = try JSONDecoder().decode(FlatUserMediaResponse.self, from: data)
+            
+            // Group by type
+            var grouped: [String: [MediaItem]] = [:]
+            for item in flatResponse.media {
+                if grouped[item.type] == nil {
+                    grouped[item.type] = []
+                }
+                grouped[item.type]?.append(item)
+            }
+            return grouped
         } catch {
             print("Error fetching user media: \(error)")
             return [:]
@@ -230,14 +371,45 @@ class NetworkManager: ObservableObject {
         guard let url = URL(string: urlString) else { return }
         
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await session.data(from: url)
             let response = try JSONDecoder().decode(FeedResponse.self, from: data)
             
             await MainActor.run {
-                self.feedItems = response.media
+                // Append new items, avoiding duplicates
+                let existingIDs = Set(self.feedItems.map { $0.uniqueID })
+                let newItems = response.media.filter { !existingIDs.contains($0.uniqueID) }
+                self.feedItems.append(contentsOf: newItems)
             }
         } catch {
             print("Error fetching feed: \(error)")
+        }
+    }
+    
+    func clearCache() async {
+        guard let url = URL(string: "\(baseURL)/api/cache/clear") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        
+        do {
+            let (_, _) = try await session.data(for: request)
+            self.etag = nil
+        } catch {
+            print("Error clearing cache: \(error)")
+        }
+    }
+    
+    func refreshCache() async {
+        guard let url = URL(string: "\(baseURL)/api/cache/refresh") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        
+        do {
+            let (_, _) = try await session.data(for: request)
+            self.etag = nil
+        } catch {
+            print("Error refreshing cache: \(error)")
         }
     }
 }
@@ -253,11 +425,6 @@ struct UserProfileResponse: Codable {
     let user: User
 }
 
-struct UserMediaResponse: Codable {
-    let success: Bool
-    let media: [String: [MediaItem]]?
-}
-
 struct FlatUserMediaResponse: Codable {
     let success: Bool
     let count: Int
@@ -269,32 +436,36 @@ struct FeedResponse: Codable {
     let media: [MediaItem]
 }
 
-// MARK: - Zoomable Image View
-struct ZoomableImageView: View {
-    let url: String
-    @Binding var aspectMode: ContentMode
+// MARK: - Enhanced Image Cache
+class ImageCache {
+    static let shared = ImageCache()
+    private let cache = NSCache<NSString, UIImage>()
+    private let diskCache = URLCache(
+        memoryCapacity: 50 * 1024 * 1024, // 50MB memory
+        diskCapacity: 200 * 1024 * 1024,   // 200MB disk
+        diskPath: "ImageCache"
+    )
     
-    var body: some View {
-        let backgroundColor: Color = .black
-        
-        ZStack {
-            backgroundColor.ignoresSafeArea()
-            
-            AsyncImage(url: URL(string: url)) { image in
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: aspectMode)
-            } placeholder: {
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle(tint: .black)) //was white
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
+    init() {
+        cache.countLimit = 200
+        cache.totalCostLimit = 100 * 1024 * 1024 // 100MB
+    }
+    
+    func setImage(_ image: UIImage, forKey key: String) {
+        cache.setObject(image, forKey: key as NSString, cost: image.pngData()?.count ?? 0)
+    }
+    
+    func getImage(forKey key: String) -> UIImage? {
+        return cache.object(forKey: key as NSString)
+    }
+    
+    func clearCache() {
+        cache.removeAllObjects()
+        diskCache.removeAllCachedResponses()
     }
 }
 
-
-// MARK: - Cached Image View
+// MARK: - Optimized Image Loading
 struct CachedAsyncImage: View {
     let url: URL?
     let placeholder: () -> AnyView
@@ -309,6 +480,7 @@ struct CachedAsyncImage: View {
                     .aspectRatio(contentMode: .fill)
             } else if isLoading {
                 ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle())
             } else {
                 placeholder()
             }
@@ -321,7 +493,7 @@ struct CachedAsyncImage: View {
     private func loadImage() {
         guard let url = url, image == nil, !isLoading else { return }
         
-        // Check cache first
+        // Check memory cache first
         if let cachedImage = ImageCache.shared.getImage(forKey: url.absoluteString) {
             self.image = cachedImage
             return
@@ -331,12 +503,19 @@ struct CachedAsyncImage: View {
         
         Task {
             do {
-                let (data, _) = try await URLSession.shared.data(from: url)
+                let request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad)
+                let (data, _) = try await URLSession.shared.data(for: request)
+                
                 if let downloadedImage = UIImage(data: data) {
+                    // Resize image if too large
+                    let resizedImage = downloadedImage.size.width > 1024 || downloadedImage.size.height > 1024
+                        ? downloadedImage.resized(toWidth: 1024) ?? downloadedImage
+                        : downloadedImage
+                    
                     await MainActor.run {
-                        self.image = downloadedImage
+                        self.image = resizedImage
                         self.isLoading = false
-                        ImageCache.shared.setImage(downloadedImage, forKey: url.absoluteString)
+                        ImageCache.shared.setImage(resizedImage, forKey: url.absoluteString)
                     }
                 }
             } catch {
@@ -348,28 +527,45 @@ struct CachedAsyncImage: View {
     }
 }
 
-// MARK: - Simple Image Cache
-class ImageCache {
-    static let shared = ImageCache()
-    private var cache = NSCache<NSString, UIImage>()
-    
-    init() {
-        cache.countLimit = 100 // Limit number of cached images
-        cache.totalCostLimit = 100 * 1024 * 1024 // 100MB limit
-    }
-    
-    func setImage(_ image: UIImage, forKey key: String) {
-        cache.setObject(image, forKey: key as NSString, cost: image.pngData()?.count ?? 0)
-    }
-    
-    func getImage(forKey key: String) -> UIImage? {
-        return cache.object(forKey: key as NSString)
-    }
-    
-    func clearCache() {
-        cache.removeAllObjects()
+// MARK: - Image Resizing Extension
+extension UIImage {
+    func resized(toWidth width: CGFloat) -> UIImage? {
+        let scale = width / self.size.width
+        let newHeight = self.size.height * scale
+        let size = CGSize(width: width, height: newHeight)
+        
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        draw(in: CGRect(origin: .zero, size: size))
+        let resizedImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return resizedImage
     }
 }
+
+// MARK: - Zoomable Image View
+struct ZoomableImageView: View {
+    let url: String
+    @Binding var aspectMode: ContentMode
+    
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            
+            AsyncImage(url: URL(string: url)) { image in
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: aspectMode)
+            } placeholder: {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+// MARK: - Main Content View
 struct ContentView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @StateObject private var favoritesManager = FavoritesManager.shared
@@ -408,8 +604,8 @@ struct ContentView: View {
         }
         .environmentObject(favoritesManager)
         .environmentObject(deletionManager)
-        .onAppear {
-            deletionManager.loadDeletionList()
+        .task {
+            await deletionManager.loadDeletionList()
         }
     }
 }
@@ -434,7 +630,6 @@ struct UsersListView: View {
                     .environmentObject(FavoritesManager.shared)
                     .environmentObject(DeletionManager.shared)) {
                     HStack {
-                        // User Avatar with caching
                         CachedAsyncImage(
                             url: user.avatar != nil ? URL(string: "\(networkManager.baseURL)\(user.avatar!)") : nil,
                             placeholder: {
@@ -473,14 +668,14 @@ struct UsersListView: View {
     }
 }
 
-// MARK: - Feed View (TikTok-style)
+// MARK: - Feed View
 struct FeedView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @EnvironmentObject var favoritesManager: FavoritesManager
     @State private var currentIndex = 0
     @State private var mediaFilter: MediaFilter = .all
     @State private var isLoading = false
-    @State private var visibleIndex: Int? = nil // Track visible item
+    @State private var visibleIndex: Int? = nil
     @State private var scrollDebounceTimer: Timer?
     
     enum MediaFilter: String, CaseIterable {
@@ -499,9 +694,14 @@ struct FeedView: View {
     
     var body: some View {
         ZStack {
-            if networkManager.feedItems.isEmpty {
-                ProgressView()
-                    .scaleEffect(1.5)
+            if networkManager.feedItems.isEmpty && !networkManager.isLoading {
+                VStack {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 60))
+                        .foregroundColor(.gray)
+                    Text("No media available")
+                        .foregroundColor(.secondary)
+                }
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
@@ -509,24 +709,16 @@ struct FeedView: View {
                             FeedItemView(item: item, isVisible: visibleIndex == index)
                                 .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
                                 .onAppear {
-                                    // Debounce scroll to prevent rapid video switching
                                     scrollDebounceTimer?.invalidate()
                                     scrollDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { _ in
                                         visibleIndex = index
                                     }
                                     
-                                    // Load more when reaching last 3 items
-                                    if index >= networkManager.feedItems.count - 3 && !isLoading {
+                                    // Load more when near end
+                                    if index >= networkManager.feedItems.count - 5 && !isLoading {
                                         Task {
                                             isLoading = true
-                                            let currentCount = networkManager.feedItems.count
-                                            await networkManager.fetchRandomFeed(mediaType: mediaFilter.apiValue)
-                                            
-                                            // Append new items instead of replacing
-                                            if networkManager.feedItems.count == currentCount {
-                                                // If no new items, fetch more
-                                                await networkManager.fetchRandomFeed(limit: 50, mediaType: mediaFilter.apiValue)
-                                            }
+                                            await networkManager.fetchRandomFeed(limit: 30, mediaType: mediaFilter.apiValue)
                                             isLoading = false
                                         }
                                     }
@@ -543,14 +735,15 @@ struct FeedView: View {
                 .ignoresSafeArea()
             }
             
-            // Filter buttons at top with rounded shadow
+            // Filter buttons
             VStack {
                 HStack {
                     ForEach(MediaFilter.allCases, id: \.self) { filter in
                         Button(action: {
                             mediaFilter = filter
                             Task {
-                                await networkManager.fetchRandomFeed(mediaType: filter.apiValue)
+                                networkManager.feedItems = []
+                                await networkManager.fetchRandomFeed(limit: 30, mediaType: filter.apiValue)
                             }
                         }) {
                             Text(filter.rawValue)
@@ -568,18 +761,27 @@ struct FeedView: View {
                 .background(Color.black.opacity(0.4))
                 .cornerRadius(25)
                 .padding(.horizontal)
-                .padding(.top, 55) // Adjusted to be higher but avoid camera island
+                .padding(.top, 55)
                 
                 Spacer()
             }
+            
+            // Loading indicator
+            if networkManager.isLoading && networkManager.feedItems.isEmpty {
+                ProgressView()
+                    .scaleEffect(1.5)
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            }
         }
         .task {
-            await networkManager.fetchRandomFeed(mediaType: mediaFilter.apiValue)
+            if networkManager.feedItems.isEmpty {
+                await networkManager.fetchRandomFeed(limit: 30, mediaType: mediaFilter.apiValue)
+            }
         }
     }
 }
 
-// MARK: - Liked View (All favorites across users)
+// MARK: - Liked View
 struct LikedView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @EnvironmentObject var favoritesManager: FavoritesManager
@@ -601,9 +803,9 @@ struct LikedView: View {
                     MediaGridView(mediaItems: allLikedItems)
                         .padding(.top, 8)
                 }
+                .navigationTitle("Liked")
             }
         }
-        .navigationTitle("Liked")
         .task {
             await loadAllLikedItems()
         }
@@ -618,16 +820,20 @@ struct LikedView: View {
         isLoading = true
         var allItems: [MediaItem] = []
         
-        await networkManager.fetchUsers()
+        if networkManager.users.isEmpty {
+            await networkManager.fetchUsers()
+        }
         
-        for user in networkManager.users {
-            let userMedia = await networkManager.fetchUserMedia(username: user.username)
-            for (_, items) in userMedia {
-                for item in items {
-                    if favoritesManager.isFavorite(item) {
-                        allItems.append(item)
-                    }
+        await withTaskGroup(of: [MediaItem].self) { group in
+            for user in networkManager.users {
+                group.addTask {
+                    let userMedia = await networkManager.fetchUserMedia(username: user.username)
+                    return userMedia.values.flatMap { $0 }.filter { favoritesManager.isFavorite($0) }
                 }
+            }
+            
+            for await items in group {
+                allItems.append(contentsOf: items)
             }
         }
         
@@ -646,11 +852,8 @@ struct FeedItemView: View {
     @EnvironmentObject var deletionManager: DeletionManager
     @State private var showUserProfile = false
     @State private var player: AVPlayer?
-    @State private var userAvatar: String?
     @State private var isLandscape = false
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
-    
-    // State for image zoom level
     @State private var aspectMode: ContentMode = .fit
     
     var body: some View {
@@ -659,35 +862,39 @@ struct FeedItemView: View {
             
             if item.isVideo {
                 GeometryReader { geometry in
-                    EnhancedVideoPlayerView(url: URL(string: item.fullURL)!, player: $player, skipDuration: skipDuration, isLandscape: $isLandscape)
-                        .frame(
-                            width: isLandscape ? geometry.size.height : geometry.size.width,
-                            height: isLandscape ? geometry.size.width : geometry.size.height
-                        )
-                        .rotationEffect(.degrees(isLandscape ? 90 : 0))
-                        .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
-                        .animation(.easeInOut(duration: 0.3), value: isLandscape)
-                        .onAppear {
-                            if isVisible {
-                                player?.play()
-                            }
+                    EnhancedVideoPlayerView(
+                        url: URL(string: item.fullURL)!,
+                        player: $player,
+                        skipDuration: skipDuration,
+                        isLandscape: $isLandscape
+                    )
+                    .frame(
+                        width: isLandscape ? geometry.size.height : geometry.size.width,
+                        height: isLandscape ? geometry.size.width : geometry.size.height
+                    )
+                    .rotationEffect(.degrees(isLandscape ? 90 : 0))
+                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                    .animation(.easeInOut(duration: 0.3), value: isLandscape)
+                    .onAppear {
+                        if isVisible {
+                            player?.play()
                         }
-                        .onDisappear {
+                    }
+                    .onDisappear {
+                        player?.pause()
+                        player?.seek(to: .zero)
+                        isLandscape = false
+                    }
+                    .onChange(of: isVisible) { _, newValue in
+                        if newValue {
+                            player?.play()
+                        } else {
                             player?.pause()
-                            player?.seek(to: .zero)
-                            isLandscape = false // Reset rotation when leaving
                         }
-                        .onChange(of: isVisible) { _, newValue in
-                            if newValue {
-                                player?.play()
-                            } else {
-                                player?.pause()
-                            }
-                        }
+                    }
                 }
                 .ignoresSafeArea()
             } else {
-                // Use the new ZoomableImageView, binding its aspectMode
                 ZoomableImageView(url: item.fullURL, aspectMode: $aspectMode)
             }
             
@@ -700,7 +907,7 @@ struct FeedItemView: View {
                         Spacer()
                         
                         VStack(spacing: 20) {
-                            // User profile button with actual avatar
+                            // User profile button
                             if let username = item.username {
                                 Button(action: {
                                     showUserProfile = true
@@ -751,7 +958,7 @@ struct FeedItemView: View {
                                     .shadow(radius: 3)
                             }
                             
-                            // Rotate button for videos OR Zoom button for images
+                            // Rotate/Zoom button
                             if item.isVideo {
                                 Button(action: {
                                     withAnimation {
@@ -767,7 +974,6 @@ struct FeedItemView: View {
                                         .clipShape(Circle())
                                 }
                             } else {
-                                // Zoom button for images, placed with other controls
                                 Button(action: {
                                     withAnimation(.easeInOut(duration: 0.2)) {
                                         aspectMode = (aspectMode == .fit) ? .fill : .fit
@@ -786,19 +992,26 @@ struct FeedItemView: View {
                                     await deletionManager.toggleDeletion(item)
                                 }
                             }) {
-                                Image(systemName: deletionManager.isMarkedForDeletion(item) ? "trash.fill" : "trash")
-                                    .font(.system(size: 28))
-                                    .foregroundColor(deletionManager.isMarkedForDeletion(item) ? .red : .white)
-                                    .shadow(radius: 3)
+                                if deletionManager.isUpdating {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(0.7)
+                                } else {
+                                    Image(systemName: deletionManager.isMarkedForDeletion(item) ? "trash.fill" : "trash")
+                                        .font(.system(size: 28))
+                                        .foregroundColor(deletionManager.isMarkedForDeletion(item) ? .red : .white)
+                                        .shadow(radius: 3)
+                                }
                             }
+                            .disabled(deletionManager.isUpdating)
                         }
                         .padding(.trailing, 16)
-                        .padding(.bottom, 160) // Adjusted for new progress bar position
+                        .padding(.bottom, 160)
                     }
                 }
             }
             
-            // Username at bottom (adjusted to not overlap progress bar) - hide in landscape
+            // Username at bottom
             if let username = item.username, !isLandscape {
                 VStack {
                     Spacer()
@@ -814,14 +1027,14 @@ struct FeedItemView: View {
                         Spacer()
                     }
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 140) // Adjusted for new progress bar position
+                    .padding(.bottom, 140)
                 }
             }
         }
     }
 }
 
-// MARK: - Enhanced Video Player View with Progress Bar and Double Tap
+// MARK: - Enhanced Video Player View
 struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
     let url: URL
     @Binding var player: AVPlayer?
@@ -830,12 +1043,15 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
     
     func makeUIViewController(context: Context) -> UIViewController {
         let container = UIViewController()
-        container.view.backgroundColor = .black // Black background for letterboxing
+        container.view.backgroundColor = .black
         
-        // Create player
+        // Create player with optimized settings
         let player = AVPlayer(url: url)
         player.automaticallyWaitsToMinimizeStalling = false
         player.volume = 1.0
+        
+        // Preload next item
+        player.currentItem?.preferredForwardBufferDuration = 5
         
         // Create player view controller
         let playerViewController = AVPlayerViewController()
@@ -857,11 +1073,11 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
         
         playerViewController.didMove(toParent: container)
         
-        // Add single tap for play/pause
+        // Add tap gesture for play/pause
         let singleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleSingleTap))
         playerViewController.view.addGestureRecognizer(singleTap)
         
-        // Create custom controls overlay
+        // Create custom controls
         let controlsView = VideoControlsView(player: player, skipDuration: skipDuration)
         controlsView.isHidden = isLandscape
         container.view.addSubview(controlsView)
@@ -871,13 +1087,13 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
             controlsView.leadingAnchor.constraint(equalTo: container.view.leadingAnchor),
             controlsView.trailingAnchor.constraint(equalTo: container.view.trailingAnchor),
             controlsView.bottomAnchor.constraint(equalTo: container.view.bottomAnchor, constant: -60),
-            controlsView.heightAnchor.constraint(equalToConstant: 70) // Increased for better touch area
+            controlsView.heightAnchor.constraint(equalToConstant: 70)
         ])
         
         context.coordinator.controlsView = controlsView
         context.coordinator.playerViewController = playerViewController
         
-        // Add gesture recognizers for double tap
+        // Add double tap gestures
         let leftDoubleTap = UITapGestureRecognizer(target: controlsView, action: #selector(VideoControlsView.leftDoubleTapped))
         leftDoubleTap.numberOfTapsRequired = 2
         leftDoubleTap.require(toFail: singleTap)
@@ -886,7 +1102,7 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
         rightDoubleTap.numberOfTapsRequired = 2
         rightDoubleTap.require(toFail: singleTap)
         
-        // Create left and right tap areas
+        // Create tap areas
         let leftTapView = UIView()
         leftTapView.translatesAutoresizingMaskIntoConstraints = false
         container.view.addSubview(leftTapView)
@@ -990,12 +1206,10 @@ class VideoControlsView: UIView {
         backgroundColor = UIColor.black.withAlphaComponent(0.2)
         layer.cornerRadius = 8
         
-        // Create a larger touch area container for the slider
         let sliderContainer = UIView()
         sliderContainer.translatesAutoresizingMaskIntoConstraints = false
         addSubview(sliderContainer)
         
-        // Progress slider
         progressSlider = UISlider()
         progressSlider.minimumTrackTintColor = .white
         progressSlider.maximumTrackTintColor = UIColor.white.withAlphaComponent(0.3)
@@ -1006,7 +1220,6 @@ class VideoControlsView: UIView {
         progressSlider.addTarget(self, action: #selector(sliderTouchEnded), for: [.touchUpInside, .touchUpOutside])
         sliderContainer.addSubview(progressSlider)
         
-        // Time label
         timeLabel = UILabel()
         timeLabel.textColor = .white
         timeLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -1019,13 +1232,11 @@ class VideoControlsView: UIView {
         addSubview(timeLabel)
         
         NSLayoutConstraint.activate([
-            // Slider container fills most of the view
             sliderContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
             sliderContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
             sliderContainer.topAnchor.constraint(equalTo: topAnchor),
-            sliderContainer.heightAnchor.constraint(equalToConstant: 44), // Larger touch area
+            sliderContainer.heightAnchor.constraint(equalToConstant: 44),
             
-            // Actual slider centered in container
             progressSlider.leadingAnchor.constraint(equalTo: sliderContainer.leadingAnchor, constant: 16),
             progressSlider.trailingAnchor.constraint(equalTo: sliderContainer.trailingAnchor, constant: -16),
             progressSlider.centerYAnchor.constraint(equalTo: sliderContainer.centerYAnchor),
@@ -1059,8 +1270,6 @@ class VideoControlsView: UIView {
         let currentTime = player.currentTime()
         let newTime = CMTimeSubtract(currentTime, CMTime(seconds: skipDuration, preferredTimescale: 1))
         player.seek(to: newTime)
-        
-        // Show skip indicator
         showSkipIndicator(forward: false)
     }
     
@@ -1068,8 +1277,6 @@ class VideoControlsView: UIView {
         let currentTime = player.currentTime()
         let newTime = CMTimeAdd(currentTime, CMTime(seconds: skipDuration, preferredTimescale: 1))
         player.seek(to: newTime)
-        
-        // Show skip indicator
         showSkipIndicator(forward: true)
     }
     
@@ -1142,7 +1349,7 @@ struct UserProfileView: View {
             ZStack(alignment: .top) {
                 ScrollView {
                     VStack(spacing: 0) {
-                        // Profile Header (scrolls away)
+                        // Profile Header
                         GeometryReader { geo in
                             VStack(spacing: 16) {
                                 CachedAsyncImage(
@@ -1179,7 +1386,7 @@ struct UserProfileView: View {
                         }
                         .frame(height: 200)
                         
-                        // Sticky Tab Selection
+                        // Tab Selection
                         Picker("Media Type", selection: $selectedTab) {
                             Text("Photos").tag("photos")
                             Text("Videos").tag("videos")
@@ -1201,7 +1408,7 @@ struct UserProfileView: View {
                     }
                 }
                 
-                // Sticky navigation title (appears when scrolled)
+                // Sticky header
                 if headerOffset < -100 {
                     HStack {
                         Text(user.username)
@@ -1219,10 +1426,7 @@ struct UserProfileView: View {
         .task {
             isLoading = true
             userMedia = await NetworkManager.shared.fetchUserMedia(username: user.username)
-            
-            // Collect all media items
             allMediaItems = userMedia.values.flatMap { $0 }
-            
             isLoading = false
         }
     }
@@ -1259,7 +1463,7 @@ struct MediaGridView: View {
     }
 }
 
-// MARK: - Media Thumbnail View (Fixed cropping)
+// MARK: - Media Thumbnail View
 struct MediaThumbnailView: View {
     let item: MediaItem
     let allItems: [MediaItem]
@@ -1273,23 +1477,49 @@ struct MediaThumbnailView: View {
         }) {
             ZStack {
                 if item.isVideo {
-                    // Video thumbnail
-                    if let thumbnail = thumbnail {
-                        Image(uiImage: thumbnail)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
-                            .clipped()
-                    } else {
-                        Rectangle()
-                            .foregroundColor(.gray.opacity(0.3))
-                            .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
-                            .onAppear {
-                                generateThumbnail()
+                    // Try server thumbnail first
+                    if let thumbnailURL = item.thumbnailURL {
+                        AsyncImage(url: URL(string: thumbnailURL)) { image in
+                            image
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
+                                .clipped()
+                        } placeholder: {
+                            if let thumbnail = thumbnail {
+                                Image(uiImage: thumbnail)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
+                                    .clipped()
+                            } else {
+                                Rectangle()
+                                    .foregroundColor(.gray.opacity(0.3))
+                                    .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
+                                    .onAppear {
+                                        generateThumbnail()
+                                    }
                             }
+                        }
+                    } else {
+                        // Fallback to local generation
+                        if let thumbnail = thumbnail {
+                            Image(uiImage: thumbnail)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
+                                .clipped()
+                        } else {
+                            Rectangle()
+                                .foregroundColor(.gray.opacity(0.3))
+                                .frame(width: UIScreen.main.bounds.width / 3 - 4, height: UIScreen.main.bounds.width / 3 - 4)
+                                .onAppear {
+                                    generateThumbnail()
+                                }
+                        }
                     }
                 } else {
-                    // Image thumbnail - cropped to square
+                    // Image thumbnail
                     AsyncImage(url: URL(string: item.fullURL)) { image in
                         image
                             .resizable()
@@ -1303,6 +1533,7 @@ struct MediaThumbnailView: View {
                     }
                 }
                 
+                // Video indicator
                 if item.isVideo {
                     VStack {
                         HStack {
@@ -1348,7 +1579,7 @@ struct MediaThumbnailView: View {
     }
 }
 
-// MARK: - Media Gallery View (Swipeable with video support)
+// MARK: - Media Gallery View
 struct MediaGalleryView: View {
     let items: [MediaItem]
     let startIndex: Int
@@ -1357,7 +1588,7 @@ struct MediaGalleryView: View {
     @EnvironmentObject var deletionManager: DeletionManager
     @State private var currentIndex: Int
     @State private var players: [Int: AVPlayer] = [:]
-    @State private var aspectModes: [Int: ContentMode] = [:] // Track aspect modes per image
+    @State private var aspectModes: [Int: ContentMode] = [:]
     @State private var isLandscape = false
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
 
@@ -1371,7 +1602,6 @@ struct MediaGalleryView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // Main swipeable media view
             TabView(selection: $currentIndex) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     ZStack {
@@ -1394,7 +1624,6 @@ struct MediaGalleryView: View {
                                 .onDisappear { players[index]?.pause() }
                             }
                         } else {
-                            // FIX: Use the new ZoomableImageView with a binding to the gallery's state
                             ZoomableImageView(
                                 url: item.fullURL,
                                 aspectMode: bindingForAspectMode(at: index)
@@ -1407,7 +1636,7 @@ struct MediaGalleryView: View {
             .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            // Top controls - hide in landscape
+            // Controls overlay
             if !isLandscape {
                 VStack {
                     HStack {
@@ -1421,7 +1650,6 @@ struct MediaGalleryView: View {
 
                         if currentIndex < items.count {
                             HStack(spacing: 20) {
-                                // Rotate button for videos
                                 if items[currentIndex].isVideo {
                                     Button(action: {
                                         withAnimation {
@@ -1434,18 +1662,23 @@ struct MediaGalleryView: View {
                                     }
                                 }
                                 
-                                // Trash
                                 Button(action: {
                                     Task {
                                         await deletionManager.toggleDeletion(items[currentIndex])
                                     }
                                 }) {
-                                    Image(systemName: deletionManager.isMarkedForDeletion(items[currentIndex]) ? "trash.fill" : "trash")
-                                        .font(.system(size: 24))
-                                        .foregroundColor(deletionManager.isMarkedForDeletion(items[currentIndex]) ? .red : .white)
+                                    if deletionManager.isUpdating {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                            .scaleEffect(0.7)
+                                    } else {
+                                        Image(systemName: deletionManager.isMarkedForDeletion(items[currentIndex]) ? "trash.fill" : "trash")
+                                            .font(.system(size: 24))
+                                            .foregroundColor(deletionManager.isMarkedForDeletion(items[currentIndex]) ? .red : .white)
+                                    }
                                 }
+                                .disabled(deletionManager.isUpdating)
 
-                                // Like
                                 Button(action: {
                                     withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
                                         favoritesManager.toggleFavorite(items[currentIndex])
@@ -1462,7 +1695,6 @@ struct MediaGalleryView: View {
 
                     Spacer()
 
-                    // Page indicator
                     Text("\(currentIndex + 1) / \(items.count)")
                         .foregroundColor(.white)
                         .padding()
@@ -1472,7 +1704,7 @@ struct MediaGalleryView: View {
                 }
             }
 
-            // Floating toggle button for images (bottom left) - hide in landscape
+            // Zoom toggle for images
             if currentIndex < items.count && !items[currentIndex].isVideo && !isLandscape {
                 VStack {
                     Spacer()
@@ -1492,7 +1724,7 @@ struct MediaGalleryView: View {
                                 .clipShape(Circle())
                         }
                         .padding(.leading, 20)
-                        .padding(.bottom, 60) // Safe for bottom nav
+                        .padding(.bottom, 60)
                         Spacer()
                     }
                 }
@@ -1501,7 +1733,7 @@ struct MediaGalleryView: View {
         .onChange(of: currentIndex) { oldValue, newValue in
             players[oldValue]?.pause()
             players[newValue]?.play()
-            isLandscape = false // Reset rotation when changing items
+            isLandscape = false
         }
     }
 
@@ -1520,92 +1752,187 @@ struct MediaGalleryView: View {
     }
 }
 
-
-// MARK: - Settings View (with skip duration)
+// MARK: - Settings View
 struct SettingsView: View {
     @StateObject private var networkManager = NetworkManager.shared
-    @State private var serverURL: String = ""
+    @State private var serverSettings = ServerSettings.load()
     @State private var showingAlert = false
+    @State private var alertMessage = ""
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
     
     var body: some View {
         NavigationStack {
             List {
-                Section("Server") {
-                    HStack {
-                        Text("Current URL")
-                        Spacer()
-                        Text(networkManager.baseURL)
+                Section("Server Connection") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Current Server")
+                            .font(.caption)
                             .foregroundColor(.secondary)
-                            .font(.system(.caption, design: .monospaced))
-                    }
-                    
-                    HStack {
-                        TextField("New Server URL", text: $serverURL)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .autocapitalization(.none)
-                            .disableAutocorrection(true)
                         
-                        Button("Update") {
-                            if !serverURL.isEmpty {
-                                networkManager.baseURL = serverURL
-                                serverURL = ""
-                                showingAlert = true
-                            }
-                        }
-                        .foregroundColor(.blue)
+                        Text(networkManager.baseURL)
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.primary)
                     }
+                    .padding(.vertical, 4)
+                    
+                    VStack(spacing: 16) {
+                        HStack {
+                            Text("http://")
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            
+                            TextField("192.168.1.123", text: $serverSettings.host)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+                                .keyboardType(.numbersAndPunctuation)
+                        }
+                        
+                        HStack {
+                            Text("Port:")
+                                .font(.system(.body))
+                                .foregroundColor(.secondary)
+                            
+                            TextField("3000", text: $serverSettings.port)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .keyboardType(.numberPad)
+                                .frame(width: 80)
+                            
+                            Spacer()
+                        }
+                        
+                        Button(action: updateServer) {
+                            HStack {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                Text("Update Connection")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                    }
+                    .padding(.vertical, 4)
                 }
                 
                 Section("Video Controls") {
-                    HStack {
-                        Text("Skip Duration")
-                        Spacer()
-                        Picker("Skip Duration", selection: $skipDuration) {
-                            Text("5 seconds").tag(5.0)
-                            Text("10 seconds").tag(10.0)
-                            Text("15 seconds").tag(15.0)
-                            Text("30 seconds").tag(30.0)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Skip Duration")
+                            Spacer()
+                            Text("\(Int(skipDuration)) seconds")
+                                .foregroundColor(.secondary)
                         }
-                        .pickerStyle(MenuPickerStyle())
+                        
+                        Slider(value: $skipDuration, in: 1...60, step: 1)
+                            .accentColor(.blue)
                     }
                 }
                 
-                Section("Cache") {
-                    Button("Clear Image Cache") {
-                        URLCache.shared.removeAllCachedResponses()
-                        ImageCache.shared.clearCache()
-                    }
-                    
-                    Button("Clear All Caches") {
-                        URLCache.shared.removeAllCachedResponses()
-                        ImageCache.shared.clearCache()
-                        // Clear user defaults cache
-                        if let bundleID = Bundle.main.bundleIdentifier {
-                            UserDefaults.standard.removePersistentDomain(forName: bundleID)
+                Section("Cache Management") {
+                    Button(action: clearImageCache) {
+                        HStack {
+                            Image(systemName: "photo")
+                            Text("Clear Image Cache")
                         }
                     }
-                    .foregroundColor(.red)
+                    
+                    Button(action: clearServerCache) {
+                        HStack {
+                            Image(systemName: "server.rack")
+                            Text("Clear Server Cache")
+                        }
+                    }
+                    
+                    Button(action: refreshServerCache) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Refresh Server Cache")
+                        }
+                    }
+                    
+                    Button(action: clearAllData) {
+                        HStack {
+                            Image(systemName: "trash")
+                            Text("Clear All Data")
+                        }
+                        .foregroundColor(.red)
+                    }
                 }
                 
                 Section("About") {
                     HStack {
                         Text("Version")
                         Spacer()
-                        Text("1.1.0")
+                        Text("2.0.0")
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    HStack {
+                        Text("Cache Size")
+                        Spacer()
+                        Text(formatBytes(URLCache.shared.currentDiskUsage))
                             .foregroundColor(.secondary)
                     }
                 }
             }
             .navigationTitle("Settings")
-            .alert("Server Updated", isPresented: $showingAlert) {
+            .alert("Notice", isPresented: $showingAlert) {
                 Button("OK", role: .cancel) { }
             } message: {
-                Text("Server URL has been updated. You may need to refresh the user list.")
-            }
-            .onAppear {
-                serverURL = networkManager.baseURL
+                Text(alertMessage)
             }
         }
+    }
+    
+    private func updateServer() {
+        networkManager.serverSettings = serverSettings
+        alertMessage = "Server updated to \(serverSettings.fullURL)"
+        showingAlert = true
+        
+        Task {
+            await networkManager.fetchUsers()
+        }
+    }
+    
+    private func clearImageCache() {
+        URLCache.shared.removeAllCachedResponses()
+        ImageCache.shared.clearCache()
+        alertMessage = "Image cache cleared"
+        showingAlert = true
+    }
+    
+    private func clearServerCache() {
+        Task {
+            await networkManager.clearCache()
+            alertMessage = "Server cache cleared"
+            showingAlert = true
+        }
+    }
+    
+    private func refreshServerCache() {
+        Task {
+            await networkManager.refreshCache()
+            await networkManager.fetchUsers()
+            alertMessage = "Server cache refreshed"
+            showingAlert = true
+        }
+    }
+    
+    private func clearAllData() {
+        URLCache.shared.removeAllCachedResponses()
+        ImageCache.shared.clearCache()
+        if let bundleID = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        }
+        alertMessage = "All data cleared"
+        showingAlert = true
+    }
+    
+    private func formatBytes(_ bytes: Int) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: Int64(bytes))
     }
 }
