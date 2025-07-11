@@ -676,7 +676,6 @@ struct FeedView: View {
     @State private var mediaFilter: MediaFilter = .all
     @State private var isLoading = false
     @State private var visibleIndex: Int? = nil
-    @State private var scrollDebounceTimer: Timer?
     
     enum MediaFilter: String, CaseIterable {
         case all = "All"
@@ -709,10 +708,8 @@ struct FeedView: View {
                             FeedItemView(item: item, isVisible: visibleIndex == index)
                                 .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
                                 .onAppear {
-                                    scrollDebounceTimer?.invalidate()
-                                    scrollDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { _ in
-                                        visibleIndex = index
-                                    }
+                                    // Set visible index immediately for videos to start playing
+                                    visibleIndex = index
                                     
                                     // Load more when near end
                                     if index >= networkManager.feedItems.count - 5 && !isLoading {
@@ -855,6 +852,7 @@ struct FeedItemView: View {
     @State private var isLandscape = false
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
     @State private var aspectMode: ContentMode = .fit
+    @State private var isPlayerReady = false
     
     var body: some View {
         ZStack {
@@ -866,7 +864,14 @@ struct FeedItemView: View {
                         url: URL(string: item.fullURL)!,
                         player: $player,
                         skipDuration: skipDuration,
-                        isLandscape: $isLandscape
+                        isLandscape: $isLandscape,
+                        shouldPlay: isVisible,
+                        onPlayerReady: {
+                            isPlayerReady = true
+                            if isVisible {
+                                player?.play()
+                            }
+                        }
                     )
                     .frame(
                         width: isLandscape ? geometry.size.height : geometry.size.width,
@@ -875,21 +880,19 @@ struct FeedItemView: View {
                     .rotationEffect(.degrees(isLandscape ? 90 : 0))
                     .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
                     .animation(.easeInOut(duration: 0.3), value: isLandscape)
-                    .onAppear {
-                        if isVisible {
-                            player?.play()
-                        }
-                    }
                     .onDisappear {
                         player?.pause()
                         player?.seek(to: .zero)
                         isLandscape = false
+                        isPlayerReady = false
                     }
                     .onChange(of: isVisible) { _, newValue in
-                        if newValue {
-                            player?.play()
-                        } else {
-                            player?.pause()
+                        if isPlayerReady {
+                            if newValue {
+                                player?.play()
+                            } else {
+                                player?.pause()
+                            }
                         }
                     }
                 }
@@ -1040,6 +1043,17 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
     @Binding var player: AVPlayer?
     let skipDuration: Double
     @Binding var isLandscape: Bool
+    let shouldPlay: Bool
+    let onPlayerReady: (() -> Void)?
+    
+    init(url: URL, player: Binding<AVPlayer?>, skipDuration: Double, isLandscape: Binding<Bool>, shouldPlay: Bool = false, onPlayerReady: (() -> Void)? = nil) {
+        self.url = url
+        self._player = player
+        self.skipDuration = skipDuration
+        self._isLandscape = isLandscape
+        self.shouldPlay = shouldPlay
+        self.onPlayerReady = onPlayerReady
+    }
     
     func makeUIViewController(context: Context) -> UIViewController {
         let container = UIViewController()
@@ -1136,8 +1150,15 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
             player.play()
         }
         
+        // Set player and notify when ready
         DispatchQueue.main.async {
             self.player = player
+            self.onPlayerReady?()
+            
+            // Start playing immediately if shouldPlay is true
+            if self.shouldPlay {
+                player.play()
+            }
         }
         
         return container
@@ -1148,6 +1169,13 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
             playerViewController.videoGravity = isLandscape ? .resizeAspectFill : .resizeAspect
         }
         context.coordinator.controlsView?.isHidden = isLandscape
+        
+        // Handle play state changes
+        if shouldPlay {
+            player?.play()
+        } else {
+            player?.pause()
+        }
     }
     
     func makeCoordinator() -> Coordinator {
@@ -1611,7 +1639,13 @@ struct MediaGalleryView: View {
                                     url: URL(string: item.fullURL)!,
                                     player: bindingForPlayer(at: index),
                                     skipDuration: skipDuration,
-                                    isLandscape: $isLandscape
+                                    isLandscape: $isLandscape,
+                                    shouldPlay: currentIndex == index,
+                                    onPlayerReady: {
+                                        if currentIndex == index {
+                                            players[index]?.play()
+                                        }
+                                    }
                                 )
                                 .frame(
                                     width: isLandscape ? geometry.size.height : geometry.size.width,
@@ -1620,8 +1654,6 @@ struct MediaGalleryView: View {
                                 .rotationEffect(.degrees(isLandscape ? 90 : 0))
                                 .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
                                 .animation(.easeInOut(duration: 0.3), value: isLandscape)
-                                .onAppear { players[index]?.play() }
-                                .onDisappear { players[index]?.pause() }
                             }
                         } else {
                             ZoomableImageView(
