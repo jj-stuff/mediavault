@@ -9,7 +9,9 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@ngrok/ngrok": "^1.1.0",
     "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
     "express": "^4.18.2",
     "fluent-ffmpeg": "^2.1.2",
     "p-limit": "^6.2.0"
