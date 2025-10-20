@@ -34,6 +34,7 @@ final class NetworkManager: ObservableObject {
         configuration.httpMaximumConnectionsPerHost = 10
 
         session = URLSession(configuration: configuration)
+        decoder.dateDecodingStrategy = .iso8601
     }
 
     func fetchUsers() async {
@@ -130,15 +131,20 @@ final class NetworkManager: ObservableObject {
     func fetchRandomFeed(limit: Int = 30, mediaType: String? = nil) async {
         await setLoading(true)
 
-        var queryItems = [URLQueryItem(name: "limit", value: "\(limit)")]
+        var queryItems = [
+            URLQueryItem(name: "limit", value: "\(limit)"),
+            URLQueryItem(name: "_t", value: UUID().uuidString)
+        ]
         if let mediaType {
             queryItems.append(URLQueryItem(name: "type", value: mediaType))
         }
 
-        guard let request = makeRequest(path: "/api/feed/random", queryItems: queryItems) else {
+        guard var request = makeRequest(path: "/api/feed/random", queryItems: queryItems) else {
             await setLoading(false)
             return
         }
+
+        request.cachePolicy = .reloadIgnoringLocalCacheData
 
         do {
             let (data, response) = try await performRequest(request)
@@ -146,10 +152,15 @@ final class NetworkManager: ObservableObject {
 
             do {
                 let response = try decoder.decode(FeedResponse.self, from: data)
+                let incoming = response.media.shuffled()
+
                 let newItems = await MainActor.run { () -> [MediaItem] in
                     let existingIDs = Set(self.feedItems.map(\.uniqueID))
-                    let freshItems = response.media.filter { !existingIDs.contains($0.uniqueID) }
-                    self.feedItems.append(contentsOf: freshItems)
+                    let freshItems = incoming.filter { !existingIDs.contains($0.uniqueID) }
+                    if !freshItems.isEmpty {
+                        self.feedItems.append(contentsOf: freshItems)
+                        self.feedItems = Self.arrangeFeed(self.feedItems)
+                    }
                     return freshItems
                 }
 
@@ -177,6 +188,67 @@ final class NetworkManager: ObservableObject {
     @MainActor
     func resetFeed() {
         feedItems = []
+    }
+
+    static func arrangeFeed(_ items: [MediaItem]) -> [MediaItem] {
+        guard !items.isEmpty else { return [] }
+
+        var buckets: [(key: String, items: [MediaItem])] = []
+        var seenKeys: Set<String> = []
+
+        for item in items {
+            let key = item.feedUserKey
+            if let index = buckets.firstIndex(where: { $0.key == key }) {
+                buckets[index].items.append(item)
+            } else {
+                buckets.append((key: key, items: [item]))
+                seenKeys.insert(key)
+            }
+        }
+
+        guard seenKeys.count > 1 else {
+            return items.shuffled()
+        }
+
+        buckets.shuffle()
+        for index in buckets.indices {
+            buckets[index].items.shuffle()
+        }
+
+        var result: [MediaItem] = []
+        var previousKey: String?
+        var rng = SystemRandomNumberGenerator()
+
+        while true {
+            let availableIndices = buckets.indices.filter { !buckets[$0].items.isEmpty }
+            if availableIndices.isEmpty { break }
+
+            let candidateIndices = availableIndices.filter { buckets[$0].key != previousKey }
+            let selectionPool = candidateIndices.isEmpty ? availableIndices : candidateIndices
+
+            guard let chosenIndex = selectionPool.randomElement(using: &rng) else { break }
+
+            var bucket = buckets[chosenIndex]
+            guard !bucket.items.isEmpty else {
+                buckets[chosenIndex].items = []
+                continue
+            }
+
+            let nextItem = bucket.items.removeFirst()
+            buckets[chosenIndex].items = bucket.items
+
+            result.append(nextItem)
+            previousKey = bucket.key
+        }
+
+        if result.count < items.count {
+            let leftovers = buckets.flatMap { $0.items }
+            if !leftovers.isEmpty {
+                result.append(contentsOf: leftovers.shuffled())
+            }
+        }
+
+        return result
     }
 }
 

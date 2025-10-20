@@ -10,6 +10,10 @@ final class DeletionManager: ObservableObject {
 
     private init() {}
 
+    func reset() {
+        markedForDeletion.removeAll()
+    }
+
     func toggleDeletion(_ item: MediaItem) async {
         let path = item.fullPath ?? item.url
 

@@ -30,8 +30,24 @@ struct CachedAsyncImage<Placeholder: View>: View {
     private func loadImage() async {
         guard !isLoading, image == nil, let url else { return }
 
-        if let cached = ImageCache.shared.image(forKey: url.absoluteString) {
+        let cacheKey = url.isFileURL ? url.path : url.absoluteString
+
+        if let cached = ImageCache.shared.image(forKey: cacheKey) {
             image = cached
+            return
+        }
+
+        if url.isFileURL {
+            do {
+                let data = try Data(contentsOf: url)
+                if let localImage = UIImage(data: data) {
+                    let resized = localImage.resizedIfNeeded(maxDimension: 1024)
+                    image = resized
+                    ImageCache.shared.store(image: resized, forKey: cacheKey)
+                }
+            } catch {
+                // ignore read failure
+            }
             return
         }
 
@@ -58,7 +74,7 @@ struct CachedAsyncImage<Placeholder: View>: View {
 
             let resized = downloaded.resizedIfNeeded(maxDimension: 1024)
             image = resized
-            ImageCache.shared.store(image: resized, forKey: url.absoluteString)
+            ImageCache.shared.store(image: resized, forKey: cacheKey)
             ImageCache.shared.store(data: data, response: response, for: request)
         } catch {
             // Swallow errors to avoid noisy logs; placeholder will remain visible.

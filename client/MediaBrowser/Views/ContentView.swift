@@ -4,7 +4,9 @@ struct ContentView: View {
     @StateObject private var networkManager = NetworkManager.shared
     @EnvironmentObject private var favoritesManager: FavoritesManager
     @EnvironmentObject private var deletionManager: DeletionManager
+    @EnvironmentObject private var localManager: LocalFileManager
     @State private var selectedTab = 1
+    @AppStorage("useLocalMode") private var useLocalMode = false
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -38,8 +40,27 @@ struct ContentView: View {
         }
         .environmentObject(favoritesManager)
         .environmentObject(deletionManager)
+        .environmentObject(localManager)
         .task {
-            await deletionManager.loadDeletionList()
+            if useLocalMode {
+                if localManager.selectedFolder != nil {
+                    localManager.refresh()
+                }
+            } else {
+                await deletionManager.loadDeletionList()
+            }
+        }
+        .onChange(of: useLocalMode) { _, newValue in
+            if newValue {
+                deletionManager.reset()
+                if localManager.selectedFolder != nil {
+                    localManager.refresh()
+                }
+            } else {
+                Task {
+                    await deletionManager.loadDeletionList()
+                }
+            }
         }
     }
 }

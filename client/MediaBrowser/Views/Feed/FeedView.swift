@@ -2,6 +2,7 @@ import SwiftUI
 
 struct FeedView: View {
     @StateObject private var networkManager = NetworkManager.shared
+    @EnvironmentObject private var localManager: LocalFileManager
     @EnvironmentObject private var favoritesManager: FavoritesManager
     @EnvironmentObject private var deletionManager: DeletionManager
     @State private var mediaFilter: MediaFilter = .all
@@ -9,10 +10,33 @@ struct FeedView: View {
     @State private var visibleIndex: Int?
 
     private let screenBounds = UIScreen.main.bounds
+    @AppStorage("useLocalMode") private var useLocalMode = false
+
+    private var displayedItems: [MediaItem] {
+        if useLocalMode {
+            return filteredLocalItems
+        }
+        return networkManager.feedItems
+    }
+
+    private var filteredLocalItems: [MediaItem] {
+        let baseItems = !localManager.feedItems.isEmpty ? localManager.feedItems : localManager.mediaItems
+
+        switch mediaFilter {
+        case .all:
+            return baseItems
+        case .photos:
+            return baseItems.filter { !$0.isVideo }
+        case .videos:
+            return baseItems.filter { $0.isVideo }
+        }
+    }
 
     var body: some View {
         ZStack {
-            if networkManager.feedItems.isEmpty && !networkManager.isLoading {
+            if useLocalMode {
+                localContent
+            } else if networkManager.feedItems.isEmpty && !networkManager.isLoading {
                 emptyState
             } else {
                 feedScrollView
@@ -20,15 +44,35 @@ struct FeedView: View {
 
             filterBar
 
-            if networkManager.isLoading && networkManager.feedItems.isEmpty {
+            if useLocalMode {
+                if localManager.isScanning && localManager.mediaItems.isEmpty {
+                    ProgressView()
+                        .scaleEffect(1.5)
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                }
+            } else if networkManager.isLoading && networkManager.feedItems.isEmpty {
                 ProgressView()
                     .scaleEffect(1.5)
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
             }
         }
         .task {
-            if networkManager.feedItems.isEmpty {
+            if useLocalMode {
+                if localManager.mediaItems.isEmpty && localManager.selectedFolder != nil && !localManager.isScanning {
+                    localManager.refresh()
+                }
+            } else if networkManager.feedItems.isEmpty {
                 await networkManager.fetchRandomFeed(limit: 30, mediaType: mediaFilter.apiValue)
+            }
+        }
+        .onChange(of: useLocalMode) { _, newValue in
+            if newValue {
+                visibleIndex = nil
+            } else {
+                Task {
+                    networkManager.resetFeed()
+                    await networkManager.fetchRandomFeed(limit: 30, mediaType: mediaFilter.apiValue)
+                }
             }
         }
     }
@@ -43,10 +87,38 @@ struct FeedView: View {
         }
     }
 
+    private var localContent: some View {
+        Group {
+            if localManager.selectedFolder == nil {
+                VStack(spacing: 16) {
+                    Image(systemName: "externaldrive.connected.to.line.below")
+                        .font(.system(size: 60))
+                        .foregroundColor(.gray)
+                    Text("Select a folder in Settings to browse local media.")
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+            } else if displayedItems.isEmpty && !localManager.isScanning {
+                VStack(spacing: 16) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 60))
+                        .foregroundColor(.gray)
+                    Text("No supported media found in the selected folder.")
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+            } else {
+                feedScrollView
+            }
+        }
+    }
+
     private var feedScrollView: some View {
         ScrollView(.vertical, showsIndicators: false) {
             LazyVStack(spacing: 0) {
-                ForEach(Array(networkManager.feedItems.enumerated()), id: \.element.id) { index, item in
+                ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in
                     FeedItemView(
                         item: item,
                         isVisible: visibleIndex == index
@@ -56,7 +128,9 @@ struct FeedView: View {
                     .frame(width: screenBounds.width, height: screenBounds.height)
                     .onAppear {
                         visibleIndex = index
-                        loadMoreItemsIfNeeded(currentIndex: index)
+                        if !useLocalMode {
+                            loadMoreItemsIfNeeded(currentIndex: index)
+                        }
                     }
                     .onDisappear {
                         if visibleIndex == index {
@@ -68,6 +142,9 @@ struct FeedView: View {
         }
         .scrollTargetBehavior(.paging)
         .ignoresSafeArea()
+        .refreshable {
+            await refreshFeed()
+        }
     }
 
     private var filterBar: some View {
@@ -103,10 +180,14 @@ struct FeedView: View {
         mediaFilter = filter
 
         Task {
-            await MainActor.run {
-                networkManager.resetFeed()
+            if useLocalMode {
+                visibleIndex = nil
+            } else {
+                await MainActor.run {
+                    networkManager.resetFeed()
+                }
+                await networkManager.fetchRandomFeed(limit: 30, mediaType: filter.apiValue)
             }
-            await networkManager.fetchRandomFeed(limit: 30, mediaType: filter.apiValue)
         }
     }
 
@@ -122,6 +203,19 @@ struct FeedView: View {
                 isRequestInFlight = false
             }
         }
+    }
+
+    private func refreshFeed() async {
+        guard !useLocalMode else {
+            localManager.refresh()
+            return
+        }
+
+        await MainActor.run {
+            visibleIndex = nil
+            networkManager.resetFeed()
+        }
+        await networkManager.fetchRandomFeed(limit: 30, mediaType: mediaFilter.apiValue)
     }
 }
 

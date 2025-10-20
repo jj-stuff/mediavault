@@ -69,7 +69,7 @@ struct MediaThumbnailView: View {
             } else {
                 placeholderView
             }
-        } else if let url = URL(string: item.fullURL) {
+        } else if let url = item.resolvedURL {
             CachedAsyncImage(url: url) {
                 placeholderView
             }
@@ -108,7 +108,7 @@ struct MediaThumbnailView: View {
             return
         }
 
-        guard let url = URL(string: item.fullURL) else { return }
+        guard let url = item.resolvedURL else { return }
 
         Task.detached(priority: .userInitiated) {
             let asset = AVAsset(url: url)
@@ -149,6 +149,7 @@ struct MediaGalleryView: View {
     @State private var isLandscape = false
 
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
+    @AppStorage("useLocalMode") private var useLocalMode = false
 
     init(items: [MediaItem], startIndex: Int) {
         self.items = items
@@ -163,10 +164,10 @@ struct MediaGalleryView: View {
             TabView(selection: $currentIndex) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     ZStack {
-                        if item.isVideo {
+                        if item.isVideo, let mediaURL = item.resolvedURL {
                             GeometryReader { geometry in
                                 EnhancedVideoPlayerView(
-                                    url: URL(string: item.fullURL)!,
+                                    url: mediaURL,
                                     player: bindingForPlayer(at: index),
                                     skipDuration: skipDuration,
                                     isLandscape: $isLandscape,
@@ -185,11 +186,13 @@ struct MediaGalleryView: View {
                                 .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
                                 .animation(.easeInOut(duration: 0.3), value: isLandscape)
                             }
-                        } else {
+                        } else if let resolved = item.resolvedURL {
                             ZoomableImageView(
-                                url: item.fullURL,
+                                url: resolved.absoluteString,
                                 aspectMode: bindingForAspectMode(at: index)
                             )
+                        } else {
+                            Color.black
                         }
                     }
                     .tag(index)
@@ -197,10 +200,20 @@ struct MediaGalleryView: View {
             }
             .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
             .ignoresSafeArea()
+            .onChange(of: currentIndex) { oldValue, newValue in
+                guard oldValue != newValue else { return }
+                if let player = players[oldValue] {
+                    player.pause()
+                    player.seek(to: .zero)
+                }
+            }
 
             if !isLandscape {
                 overlayControls
             }
+        }
+        .onDisappear {
+            stopAllPlayers()
         }
     }
 
@@ -208,6 +221,7 @@ struct MediaGalleryView: View {
         VStack {
             HStack {
                 Button("Done") {
+                    stopAllPlayers()
                     dismiss()
                 }
                 .foregroundColor(.white)
@@ -249,22 +263,28 @@ struct MediaGalleryView: View {
                 }
             }
 
-            Button {
-                Task {
-                    await deletionManager.toggleDeletion(item)
+            if useLocalMode {
+                Image(systemName: "minus.circle")
+                    .font(.system(size: 24))
+                    .foregroundColor(.white.opacity(0.4))
+            } else {
+                Button {
+                    Task {
+                        await deletionManager.toggleDeletion(item)
+                    }
+                } label: {
+                    if deletionManager.isUpdating {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(0.7)
+                    } else {
+                        Image(systemName: deletionManager.isMarkedForDeletion(item) ? "trash.fill" : "trash")
+                            .font(.system(size: 24))
+                            .foregroundColor(deletionManager.isMarkedForDeletion(item) ? .red : .white)
+                    }
                 }
-            } label: {
-                if deletionManager.isUpdating {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                        .scaleEffect(0.7)
-                } else {
-                    Image(systemName: deletionManager.isMarkedForDeletion(item) ? "trash.fill" : "trash")
-                        .font(.system(size: 24))
-                        .foregroundColor(deletionManager.isMarkedForDeletion(item) ? .red : .white)
-                }
+                .disabled(deletionManager.isUpdating)
             }
-            .disabled(deletionManager.isUpdating)
 
             Button {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
@@ -291,5 +311,13 @@ struct MediaGalleryView: View {
             get: { aspectModes[index] ?? .fit },
             set: { aspectModes[index] = $0 }
         )
+    }
+
+    private func stopAllPlayers() {
+        for (_, player) in players {
+            player.pause()
+            player.seek(to: .zero)
+        }
+        players.removeAll()
     }
 }

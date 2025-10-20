@@ -15,6 +15,7 @@ struct FeedItemView: View {
     @State private var isPlayerReady = false
 
     @AppStorage("skipDuration") private var skipDuration: Double = 5.0
+    @AppStorage("useLocalMode") private var useLocalMode = false
 
     var body: some View {
         ZStack {
@@ -34,10 +35,10 @@ struct FeedItemView: View {
 
     @ViewBuilder
     private var mediaContent: some View {
-        if item.isVideo {
+        if item.isVideo, let mediaURL = item.resolvedURL {
             GeometryReader { geometry in
                 EnhancedVideoPlayerView(
-                    url: URL(string: item.fullURL)!,
+                    url: mediaURL,
                     player: $player,
                     skipDuration: skipDuration,
                     isLandscape: $isLandscape,
@@ -62,11 +63,11 @@ struct FeedItemView: View {
                     isLandscape = false
                     isPlayerReady = false
                 }
-                .onChange(of: isVisible) { _, newValue in
-                    guard isPlayerReady else { return }
-                    if newValue {
-                        player?.play()
-                    } else {
+                    .onChange(of: isVisible) { _, newValue in
+                        guard isPlayerReady else { return }
+                        if newValue {
+                            player?.play()
+                        } else {
                         player?.pause()
                     }
                 }
@@ -91,7 +92,7 @@ struct FeedItemView: View {
 
     private var controlStack: some View {
         VStack(spacing: 20) {
-            if let username = item.username {
+            if let username = item.username, !useLocalMode {
                 Button { showUserProfile = true } label: {
                     userAvatar(username: username)
                 }
@@ -151,7 +152,12 @@ struct FeedItemView: View {
                     await deletionManager.toggleDeletion(item)
                 }
             } label: {
-                if deletionManager.isUpdating {
+                if useLocalMode {
+                    Image(systemName: "minus.circle")
+                        .font(.system(size: 28))
+                        .foregroundColor(.white.opacity(0.4))
+                        .shadow(radius: 3)
+                } else if deletionManager.isUpdating {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: .white))
                         .scaleEffect(0.7)
@@ -162,7 +168,7 @@ struct FeedItemView: View {
                         .shadow(radius: 3)
                 }
             }
-            .disabled(deletionManager.isUpdating)
+            .disabled(useLocalMode || deletionManager.isUpdating)
         }
     }
 

@@ -2,9 +2,11 @@ import SwiftUI
 
 struct LikedView: View {
     @StateObject private var networkManager = NetworkManager.shared
+    @EnvironmentObject private var localManager: LocalFileManager
     @EnvironmentObject private var favoritesManager: FavoritesManager
     @State private var allLikedItems: [MediaItem] = []
     @State private var isLoading = true
+    @AppStorage("useLocalMode") private var useLocalMode = false
 
     var body: some View {
         NavigationStack {
@@ -23,6 +25,11 @@ struct LikedView: View {
         .refreshable {
             await loadLikedItems()
         }
+        .onChange(of: useLocalMode) { _, _ in
+            Task {
+                await loadLikedItems()
+            }
+        }
     }
 
     private var emptyState: some View {
@@ -38,6 +45,15 @@ struct LikedView: View {
     private func loadLikedItems() async {
         isLoading = true
         var aggregatedItems: [MediaItem] = []
+
+        if useLocalMode {
+            let localItems = localManager.mediaItems.filter { favoritesManager.isFavorite($0) }
+            await MainActor.run {
+                allLikedItems = localItems
+                isLoading = false
+            }
+            return
+        }
 
         if networkManager.users.isEmpty {
             await networkManager.fetchUsers()
