@@ -66,7 +66,6 @@ struct FeedItemView: View {
     @Environment(LikesService.self) private var likesService
     @State private var image: UIImage?
     @State private var player: AVPlayer?
-    @State private var showHeart = false
     @State private var isLandscapeVideo = false
     @State private var videoGravity: AVLayerVideoGravity = .resizeAspectFill
 
@@ -79,15 +78,8 @@ struct FeedItemView: View {
             case .video: videoView
             }
 
-            if showHeart {
-                Image(systemName: "heart.fill")
-                    .font(.system(size: 80)).foregroundStyle(.red)
-                    .transition(.scale.combined(with: .opacity))
-            }
-
             overlayInfo
         }
-        .onTapGesture(count: 2) { doubleTapLike() }
     }
 
     // MARK: Image
@@ -105,9 +97,15 @@ struct FeedItemView: View {
         }
         .task {
             let url = item.url
-            image = await { @concurrent () async -> UIImage? in
-                Self.downsampledImage(url: url, maxDimension: 2000)
-            }()
+            if url.scheme == "http" || url.scheme == "https" {
+                if let data = try? await URLSession.shared.data(from: url).0 {
+                    image = UIImage(data: data)
+                }
+            } else {
+                image = await { @concurrent () async -> UIImage? in
+                    Self.downsampledImage(url: url, maxDimension: 2000)
+                }()
+            }
         }
     }
 
@@ -211,19 +209,7 @@ struct FeedItemView: View {
                 }
             }
             .padding(.horizontal)
-            .safeAreaPadding(.bottom)
-            .padding(.bottom, 8)
-        }
-    }
-
-    private func doubleTapLike() {
-        guard let rootURL else { return }
-        if !likesService.isLiked(mediaItem: item, rootURL: rootURL) {
-            likesService.toggleLike(mediaItem: item, rootURL: rootURL)
-        }
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) { showHeart = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            withAnimation(.easeOut(duration: 0.3)) { showHeart = false }
+            .padding(.bottom, 80)
         }
     }
 }

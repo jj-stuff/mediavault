@@ -105,6 +105,22 @@ final class MediaScannerService {
         return items
     }
 
+    // MARK: Remote
+
+    func fetchFromRemote(service: RemoteServerService) async {
+        isScanning = true
+        scanError = nil
+        profiles = []
+        activeSecurityScopedURL?.stopAccessingSecurityScopedResource()
+        activeSecurityScopedURL = nil
+        do {
+            profiles = try await service.fetchProfiles()
+        } catch {
+            scanError = error.localizedDescription
+        }
+        isScanning = false
+    }
+
     nonisolated private func collectMedia(in directoryURL: URL, profileID: UUID, profileName: String, subfolder: String?, fm: FileManager) -> [MediaItem] {
         guard let files = try? fm.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
             return []

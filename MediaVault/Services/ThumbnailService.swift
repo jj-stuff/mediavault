@@ -19,12 +19,25 @@ final class ThumbnailService {
         let key = item.url as NSURL
         if let cached = cache.object(forKey: key) { return cached }
 
-        let url = item.url
-        let mediaType = item.mediaType
-        let image = await generateThumbnail(url: url, mediaType: mediaType, size: size)
+        let image: UIImage?
+        if item.url.scheme == "http" || item.url.scheme == "https" {
+            image = await fetchRemoteThumbnail(item: item)
+        } else {
+            image = await generateThumbnail(url: item.url, mediaType: item.mediaType, size: size)
+        }
 
         if let image { cache.setObject(image, forKey: key) }
         return image
+    }
+
+    /// Fetches thumbnail from the server's /api/thumbnails/ endpoint.
+    /// The item URL points to /api/files/...; swap the path component to /api/thumbnails/.
+    private func fetchRemoteThumbnail(item: MediaItem) async -> UIImage? {
+        var urlStr = item.url.absoluteString
+        urlStr = urlStr.replacingOccurrences(of: "/api/files/", with: "/api/thumbnails/")
+        guard let url = URL(string: urlStr),
+              let data = try? await URLSession.shared.data(from: url).0 else { return nil }
+        return UIImage(data: data)
     }
 
     /// Runs off the main actor for heavy image/video processing.

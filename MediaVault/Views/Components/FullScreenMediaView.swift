@@ -115,9 +115,15 @@ struct ZoomableImageView: View {
 
     private func loadImage() async {
         let fileURL = url
-        image = await { @concurrent () async -> UIImage? in
-            return Self.downsampledImage(url: fileURL, maxDimension: 3000)
-        }()
+        if fileURL.scheme == "http" || fileURL.scheme == "https" {
+            if let data = try? await URLSession.shared.data(from: fileURL).0 {
+                image = UIImage(data: data)
+            }
+        } else {
+            image = await { @concurrent () async -> UIImage? in
+                return Self.downsampledImage(url: fileURL, maxDimension: 3000)
+            }()
+        }
     }
 
     /// Loads via CGImageSource with downsampling — avoids IOSurface memory errors
