@@ -128,13 +128,28 @@ final class RemoteServerService {
         )
     }
 
+    /// Moves a media file on the server to its Trash folder.
+    /// Calls DELETE /api/media/{path}
+    func deleteItem(path: String) async throws {
+        guard let base = baseURL else { throw RemoteError.notConfigured }
+        let url = base.appendingPathComponent("api/media").appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw RemoteError.deleteFailed
+        }
+    }
+
     enum RemoteError: LocalizedError {
         case notConfigured
         case unauthorized
+        case deleteFailed
         var errorDescription: String? {
             switch self {
             case .notConfigured: return "Server URL is not configured."
             case .unauthorized:  return "Not authenticated. Please sign in first."
+            case .deleteFailed:  return "The server could not move the file to Trash."
             }
         }
     }

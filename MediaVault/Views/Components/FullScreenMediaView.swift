@@ -2,20 +2,31 @@ import SwiftUI
 import AVKit
 
 struct FullScreenMediaView: View {
-    let items: [MediaItem]
     let initialItem: MediaItem
     let rootURL: URL?
     @Environment(LikesService.self) private var likesService
+    @Environment(MediaScannerService.self) private var scanner
+    @Environment(RemoteServerService.self) private var remoteService
     @Environment(\.dismiss) private var dismiss
+    @State private var localItems: [MediaItem]
     @State private var currentIndex: Int = 0
     @State private var showOverlay = true
+    @State private var showDeleteAlert = false
+    @State private var showErrorAlert = false
+    @State private var deleteError: String?
+
+    init(items: [MediaItem], initialItem: MediaItem, rootURL: URL?) {
+        self.initialItem = initialItem
+        self.rootURL = rootURL
+        self._localItems = State(initialValue: items)
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             TabView(selection: $currentIndex) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                ForEach(Array(localItems.enumerated()), id: \.element.id) { index, item in
                     MediaContentView(item: item, showOverlay: $showOverlay)
                         .tag(index)
                 }
@@ -26,10 +37,23 @@ struct FullScreenMediaView: View {
             if showOverlay { overlayControls }
         }
         .onAppear {
-            if let idx = items.firstIndex(where: { $0.id == initialItem.id }) { currentIndex = idx }
+            if let idx = localItems.firstIndex(where: { $0.id == initialItem.id }) { currentIndex = idx }
         }
         .statusBarHidden(!showOverlay)
         .preferredColorScheme(.dark)
+        .alert("Move to Trash?", isPresented: $showDeleteAlert) {
+            Button("Move to Trash", role: .destructive) { Task { await deleteCurrentItem() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if currentIndex < localItems.count {
+                Text("\"\(localItems[currentIndex].fileName)\" will be moved to the Trash folder.")
+            }
+        }
+        .alert("Delete Failed", isPresented: $showErrorAlert) {
+            Button("OK") { deleteError = nil }
+        } message: {
+            Text(deleteError ?? "An unknown error occurred.")
+        }
     }
 
     private var overlayControls: some View {
@@ -40,22 +64,22 @@ struct FullScreenMediaView: View {
                         .foregroundStyle(.white).padding(10).background(.ultraThinMaterial, in: Circle())
                 }
                 Spacer()
-                if currentIndex < items.count {
+                if currentIndex < localItems.count {
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text(items[currentIndex].profileName).font(.subheadline).fontWeight(.semibold)
-                        Text("\(currentIndex + 1) / \(items.count)").font(.caption).foregroundStyle(.secondary)
+                        Text(localItems[currentIndex].profileName).font(.subheadline).fontWeight(.semibold)
+                        Text("\(currentIndex + 1) / \(localItems.count)").font(.caption).foregroundStyle(.secondary)
                     }.foregroundStyle(.white)
                 }
             }.padding()
             Spacer()
-            if currentIndex < items.count, let rootURL {
-                bottomBar(item: items[currentIndex], rootURL: rootURL)
+            if currentIndex < localItems.count, let rootURL {
+                bottomBar(item: localItems[currentIndex], rootURL: rootURL)
             }
         }
     }
 
     private func bottomBar(item: MediaItem, rootURL: URL) -> some View {
-        HStack(spacing: 20) {
+        HStack(spacing: 16) {
             let isLiked = likesService.isLiked(mediaItem: item, rootURL: rootURL)
             Button {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
@@ -66,6 +90,11 @@ struct FullScreenMediaView: View {
                     .font(.title2).foregroundStyle(isLiked ? .red : .white)
                     .padding(12).background(.ultraThinMaterial, in: Circle())
             }
+            Button { showDeleteAlert = true } label: {
+                Image(systemName: "trash")
+                    .font(.title2).foregroundStyle(.white)
+                    .padding(12).background(.ultraThinMaterial, in: Circle())
+            }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
                 Text(item.fileName).font(.caption2).lineLimit(1)
@@ -74,6 +103,57 @@ struct FullScreenMediaView: View {
         }
         .padding()
         .background(LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .top, endPoint: .bottom))
+    }
+
+    // MARK: - Delete logic
+
+    private func deleteCurrentItem() async {
+        guard currentIndex < localItems.count else { return }
+        let item = localItems[currentIndex]
+
+        do {
+            if item.url.isFileURL {
+                guard let rootURL else { return }
+                try moveToTrash(item: item, rootURL: rootURL)
+            } else {
+                // Remote: extract relative path from the full file URL
+                guard let filesBase = remoteService.filesBaseURL else { return }
+                let baseStr = filesBase.absoluteString.hasSuffix("/")
+                    ? filesBase.absoluteString
+                    : filesBase.absoluteString + "/"
+                let itemStr = item.url.absoluteString
+                guard itemStr.hasPrefix(baseStr) else { return }
+                let path = String(itemStr.dropFirst(baseStr.count))
+                try await remoteService.deleteItem(path: path)
+            }
+
+            scanner.removeItem(id: item.id)
+
+            localItems.remove(at: currentIndex)
+            if localItems.isEmpty {
+                dismiss()
+            } else if currentIndex >= localItems.count {
+                currentIndex = localItems.count - 1
+            }
+        } catch {
+            deleteError = error.localizedDescription
+            showErrorAlert = true
+        }
+    }
+
+    private func moveToTrash(item: MediaItem, rootURL: URL) throws {
+        let fm = FileManager.default
+        let trashFolder = rootURL.appendingPathComponent("Trash")
+        if !fm.fileExists(atPath: trashFolder.path) {
+            try fm.createDirectory(at: trashFolder, withIntermediateDirectories: true, attributes: nil)
+        }
+        var dest = trashFolder.appendingPathComponent(item.fileName)
+        if fm.fileExists(atPath: dest.path) {
+            let base = item.url.deletingPathExtension().lastPathComponent
+            let ext  = item.url.pathExtension
+            dest = trashFolder.appendingPathComponent("\(base)_\(Int(Date().timeIntervalSince1970)).\(ext)")
+        }
+        try fm.moveItem(at: item.url, to: dest)
     }
 }
 

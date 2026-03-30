@@ -105,6 +105,15 @@ final class MediaScannerService {
         return items
     }
 
+    // MARK: In-memory mutation
+
+    /// Removes a single item from all profiles without a full rescan.
+    func removeItem(id: UUID) {
+        for i in 0..<profiles.count {
+            profiles[i].mediaItems.removeAll { $0.id == id }
+        }
+    }
+
     // MARK: Remote
 
     func fetchFromRemote(service: RemoteServerService) async {

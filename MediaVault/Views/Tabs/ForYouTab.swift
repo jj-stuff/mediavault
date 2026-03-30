@@ -41,9 +41,11 @@ struct ForYouTab: View {
         ScrollView(.vertical) {
             LazyVStack(spacing: 0) {
                 ForEach(Array(feedItems.enumerated()), id: \.element.id) { index, item in
-                    FeedItemView(item: item, rootURL: rootURL)
-                        .containerRelativeFrame([.horizontal, .vertical])
-                        .onAppear { loadMoreIfNeeded(index: index) }
+                    FeedItemView(item: item, rootURL: rootURL, onDelete: { id in
+                        feedItems.removeAll { $0.id == id }
+                    })
+                    .containerRelativeFrame([.horizontal, .vertical])
+                    .onAppear { loadMoreIfNeeded(index: index) }
                 }
             }
         }
@@ -63,11 +65,22 @@ struct ForYouTab: View {
 struct FeedItemView: View {
     let item: MediaItem
     let rootURL: URL?
+    let onDelete: (UUID) -> Void
+
     @Environment(LikesService.self) private var likesService
+    @Environment(MediaScannerService.self) private var scanner
+    @Environment(RemoteServerService.self) private var remoteService
+
     @State private var image: UIImage?
     @State private var player: AVPlayer?
     @State private var isLandscapeVideo = false
+    @State private var isLandscapeImage = false
     @State private var videoGravity: AVLayerVideoGravity = .resizeAspectFill
+
+    @State private var showDeleteAlert = false
+    @State private var showErrorAlert = false
+    @State private var deleteError: String?
+    @State private var showProfile = false
 
     var body: some View {
         ZStack {
@@ -79,6 +92,25 @@ struct FeedItemView: View {
             }
 
             overlayInfo
+        }
+        .onDisappear { restorePortrait() }
+        .alert("Move to Trash?", isPresented: $showDeleteAlert) {
+            Button("Move to Trash", role: .destructive) { Task { await deleteItem() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\"\(item.fileName)\" will be moved to the Trash folder.")
+        }
+        .alert("Delete Failed", isPresented: $showErrorAlert) {
+            Button("OK") { deleteError = nil }
+        } message: {
+            Text(deleteError ?? "An unknown error occurred.")
+        }
+        .sheet(isPresented: $showProfile) {
+            if let profile = scanner.profiles.first(where: { $0.id == item.profileID }) {
+                NavigationStack {
+                    ProfileDetailView(profile: profile, rootURL: rootURL)
+                }
+            }
         }
     }
 
@@ -97,14 +129,19 @@ struct FeedItemView: View {
         }
         .task {
             let url = item.url
+            var loaded: UIImage?
             if url.scheme == "http" || url.scheme == "https" {
                 if let data = try? await URLSession.shared.data(from: url).0 {
-                    image = UIImage(data: data)
+                    loaded = UIImage(data: data)
                 }
             } else {
-                image = await { @concurrent () async -> UIImage? in
+                loaded = await { @concurrent () async -> UIImage? in
                     Self.downsampledImage(url: url, maxDimension: 2000)
                 }()
+            }
+            image = loaded
+            if let img = loaded {
+                isLandscapeImage = img.size.width > img.size.height
             }
         }
     }
@@ -161,16 +198,21 @@ struct FeedItemView: View {
 
     private var overlayInfo: some View {
         VStack(spacing: 0) {
-            // Info at top-right
+            // Profile name at top-left — tap to open profile page
             HStack(alignment: .top) {
-                Spacer()
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text(item.profileName).font(.subheadline).fontWeight(.bold)
-                    Text(item.fileName).font(.caption).opacity(0.8)
-                    if let sub = item.subfolder { Text(sub).font(.caption2).opacity(0.6) }
+                Button {
+                    showProfile = true
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.profileName).font(.subheadline).fontWeight(.bold)
+                        Text(item.fileName).font(.caption).opacity(0.8)
+                        if let sub = item.subfolder { Text(sub).font(.caption2).opacity(0.6) }
+                    }
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
                 }
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.trailing)
+                .buttonStyle(.plain)
+                Spacer()
             }
             .padding(.horizontal)
             .safeAreaPadding(.top)
@@ -179,37 +221,96 @@ struct FeedItemView: View {
 
             Spacer()
 
-            // Action buttons on the right, above the tab bar
+            // Action buttons on the right side
             HStack {
                 Spacer()
                 VStack(spacing: 16) {
-                    if isLandscapeVideo {
-                        Button {
-                            videoGravity = videoGravity == .resizeAspect ? .resizeAspectFill : .resizeAspect
-                        } label: {
-                            Image(systemName: videoGravity == .resizeAspect
-                                  ? "arrow.up.left.and.arrow.down.right"
-                                  : "arrow.down.right.and.arrow.up.left")
+                    // Rotate-to-landscape button for landscape content
+                    if isLandscapeVideo || isLandscapeImage {
+                        Button { rotateToLandscape() } label: {
+                            Image(systemName: "arrow.clockwise")
                                 .font(.title3).foregroundStyle(.white)
                                 .padding(10).background(.ultraThinMaterial, in: Circle())
                         }
                     }
+
+                    // Like button — tap to like, long-press for delete
                     if let rootURL {
                         let isLiked = likesService.isLiked(mediaItem: item, rootURL: rootURL)
-                        Button {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                                likesService.toggleLike(mediaItem: item, rootURL: rootURL)
+                        Image(systemName: isLiked ? "heart.fill" : "heart")
+                            .font(.title2)
+                            .foregroundStyle(isLiked ? .red : .white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .onTapGesture {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                    likesService.toggleLike(mediaItem: item, rootURL: rootURL)
+                                }
                             }
-                        } label: {
-                            Image(systemName: isLiked ? "heart.fill" : "heart")
-                                .font(.title2).foregroundStyle(isLiked ? .red : .white)
-                                .padding(12).background(.ultraThinMaterial, in: Circle())
-                        }
+                            .onLongPressGesture(minimumDuration: 0.5) {
+                                showDeleteAlert = true
+                            }
                     }
                 }
             }
             .padding(.horizontal)
             .padding(.bottom, 80)
         }
+    }
+
+    // MARK: Rotate
+
+    private func rotateToLandscape() {
+        AppDelegate.orientationLock = .landscape
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        let preferences = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: .landscape)
+        try? windowScene.requestGeometryUpdate(preferences)
+    }
+
+    private func restorePortrait() {
+        AppDelegate.orientationLock = .portrait
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        let preferences = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: .portrait)
+        try? windowScene.requestGeometryUpdate(preferences)
+    }
+
+    // MARK: Delete
+
+    private func deleteItem() async {
+        do {
+            if item.url.isFileURL {
+                guard let rootURL else { return }
+                try moveToTrash(item: item, rootURL: rootURL)
+            } else {
+                guard let filesBase = remoteService.filesBaseURL else { return }
+                let baseStr = filesBase.absoluteString.hasSuffix("/")
+                    ? filesBase.absoluteString
+                    : filesBase.absoluteString + "/"
+                let itemStr = item.url.absoluteString
+                guard itemStr.hasPrefix(baseStr) else { return }
+                let path = String(itemStr.dropFirst(baseStr.count))
+                try await remoteService.deleteItem(path: path)
+            }
+            scanner.removeItem(id: item.id)
+            onDelete(item.id)
+        } catch {
+            deleteError = error.localizedDescription
+            showErrorAlert = true
+        }
+    }
+
+    private func moveToTrash(item: MediaItem, rootURL: URL) throws {
+        let fm = FileManager.default
+        let trashFolder = rootURL.appendingPathComponent("Trash")
+        if !fm.fileExists(atPath: trashFolder.path) {
+            try fm.createDirectory(at: trashFolder, withIntermediateDirectories: true, attributes: nil)
+        }
+        var dest = trashFolder.appendingPathComponent(item.fileName)
+        if fm.fileExists(atPath: dest.path) {
+            let base = item.url.deletingPathExtension().lastPathComponent
+            let ext  = item.url.pathExtension
+            dest = trashFolder.appendingPathComponent("\(base)_\(Int(Date().timeIntervalSince1970)).\(ext)")
+        }
+        try fm.moveItem(at: item.url, to: dest)
     }
 }
