@@ -1,0 +1,50 @@
+# NAS deployment: pulls the prebuilt image instead of building from source.
+#
+# This file is self-contained — copy it and a .env next to it onto the NAS and run
+# `docker compose -f compose.prebuilt.yml up -d`. No need to clone the repo.
+#
+# Use compose.yml instead when developing locally against the source.
+
+services:
+  mediavault:
+    image: ghcr.io/jj-stuff/mediavault-server:latest
+    container_name: mediavault
+    restart: unless-stopped
+
+    ports:
+      # Host port on the left. The container always listens on 8000 internally.
+      - "${MEDIAVAULT_PORT:-8000}:8000"
+
+    environment:
+      MEDIAVAULT_PASSWORD: ${MEDIAVAULT_PASSWORD:?set MEDIAVAULT_PASSWORD in .env}
+      MEDIAVAULT_SECRET_KEY: ${MEDIAVAULT_SECRET_KEY:?set MEDIAVAULT_SECRET_KEY in .env}
+      MEDIAVAULT_HTTPS_ONLY: ${MEDIAVAULT_HTTPS_ONLY:-0}
+      MEDIAVAULT_THUMB_SIZE: ${MEDIAVAULT_THUMB_SIZE:-400}
+      MEDIAVAULT_SCAN_CACHE_TTL: ${MEDIAVAULT_SCAN_CACHE_TTL:-300}
+      MEDIAVAULT_TRASH_DIR: /trash
+
+    volumes:
+      # ---------------------------------------------------------------------
+      # ONE folder already holding a subfolder per person. The common case.
+      # ---------------------------------------------------------------------
+      - ${MEDIAVAULT_MEDIA_DIR:?set MEDIAVAULT_MEDIA_DIR in .env}:/media
+
+      # ---------------------------------------------------------------------
+      # SEVERAL folders: comment out the line above, uncomment these, and map
+      # each host folder to a name under /media. That name becomes the profile
+      # name in the app. On a Synology the paths look like /volume1/....
+      #
+      #   - /volume1/photos/alice:/media/alice
+      #   - /volume1/media/bob:/media/bob
+      #
+      # Append :ro for read-only — deletes from that folder will then fail.
+      # ---------------------------------------------------------------------
+
+      # Must be real volumes. Otherwise deleted files are lost when the container
+      # is recreated, and every thumbnail is re-rendered after each restart.
+      - ${MEDIAVAULT_TRASH_DIR:-mediavault_trash}:/trash
+      - thumbs:/cache/thumbs
+
+volumes:
+  thumbs:
+  mediavault_trash:
