@@ -13,7 +13,47 @@ media root becomes a profile.
 └── Trash/            → deletes land here; never shown as a profile
 ```
 
-## Running it with Docker
+## Running it on a NAS (prebuilt image)
+
+A GitHub Actions workflow publishes a multi-architecture image (amd64 + arm64) on
+every change under `server/`, so the NAS pulls a ready-made image instead of
+compiling one:
+
+```
+ghcr.io/jj-stuff/mediavault-server:latest
+<your-dockerhub-user>/mediavault-server:latest
+```
+
+Docker Hub is published only once `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` exist
+as repository secrets — it is there because some NAS container UIs will only pull
+from the official registry.
+
+Copy `compose.prebuilt.yml` and a filled-in `.env` onto the NAS — no clone needed:
+
+```bash
+docker compose -f compose.prebuilt.yml up -d
+```
+
+Or, straight from the NAS container UI, pull `mediavault-server:latest` and set:
+
+| | |
+|---|---|
+| Port | host port → `8000` in the container |
+| `MEDIAVAULT_PASSWORD` | your sign-in password |
+| `MEDIAVAULT_SECRET_KEY` | 32+ random chars |
+| `MEDIAVAULT_TRASH_DIR` | `/trash` |
+| Volume | your media folder → `/media` |
+| Volume | a folder for deletes → `/trash` |
+| Volume | a folder for the cache → `/cache/thumbs` |
+
+### Image visibility
+
+Both registries default to matching the source repo, which is private. Either sign
+the NAS in to the registry once, or make the package public if you do not mind the
+server source being readable — the image contains it. Nothing sensitive is baked in;
+the password and secret key are runtime environment variables.
+
+## Building it yourself with Docker
 
 Only the `server/` folder is ever sent to Docker — the build context is this
 directory, so the iOS app in `app/` never enters the image. Run every command below
