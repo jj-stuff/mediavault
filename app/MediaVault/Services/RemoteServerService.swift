@@ -100,6 +100,48 @@ final class RemoteServerService {
         }
     }
 
+    /// Result of the last connection test, for display in Settings.
+    private(set) var diagnosis: String?
+
+    /// Probes the server and reports exactly what happened.
+    ///
+    /// Exists because "it doesn't work" spans two completely different problems
+    /// that the sign-in sheet cannot tell apart: never reaching the server at all
+    /// (network, port, firewall, ATS) versus reaching it and not being signed in.
+    /// A 401 here is a *success* — it proves the connection works end to end.
+    func testConnection() async {
+        guard let base = baseURL else {
+            diagnosis = "No server address set."
+            return
+        }
+
+        diagnosis = "Testing \(base.absoluteString)…"
+
+        var request = URLRequest(url: base.appending(path: "api/auth/check"))
+        request.timeoutInterval = 10
+        // Ignore any cached response, or a previous result masks the current state.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        do {
+            let (_, response) = try await urlSession.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            diagnosis = switch code {
+            case 200:
+                "Connected and signed in. Everything works."
+            case 401, 403:
+                "Reached the server — the network side is fine. Tap Sign In to authenticate."
+            case 404:
+                "Reached something at that address, but it isn't a MediaVault server."
+            default:
+                "Reached the server, but it replied \(code)."
+            }
+            isAuthenticated = code == 200
+        } catch {
+            diagnosis = "Couldn't reach \(base.absoluteString)\n\n\(NetworkErrorMessage.explain(error))"
+            isAuthenticated = false
+        }
+    }
+
     // MARK: - Library
 
     /// Fetches every profile and its items, one request per profile in parallel.

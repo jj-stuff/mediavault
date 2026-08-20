@@ -77,6 +77,19 @@ struct SettingsTab: View {
                     .foregroundStyle(remote.isAuthenticated ? .green : .orange)
                 }
 
+                Button {
+                    Task { await remote.testConnection() }
+                } label: {
+                    Label("Test Connection", systemImage: "stethoscope")
+                }
+
+                if let diagnosis = remote.diagnosis {
+                    Text(diagnosis)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
                 if remote.isAuthenticated {
                     Button {
                         Task { await library.refresh() }

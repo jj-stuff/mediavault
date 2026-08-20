@@ -129,40 +129,8 @@ struct LoginWebView: UIViewRepresentable {
             let nsError = error as NSError
             guard !(nsError.domain == NSURLErrorDomain
                     && nsError.code == NSURLErrorCancelled) else { return }
-            failure.wrappedValue = Self.explain(nsError)
+            failure.wrappedValue = NetworkErrorMessage.explain(nsError)
         }
 
-        /// Turns the common transport failures into something actionable. The raw
-        /// messages ("The operation couldn't be completed") explain nothing.
-        private static func explain(_ error: NSError) -> String {
-            guard error.domain == NSURLErrorDomain else { return error.localizedDescription }
-
-            return switch error.code {
-            case NSURLErrorAppTransportSecurityRequiresSecureConnection:
-                """
-                iOS blocked this because it isn't an HTTPS address. Plain HTTP is \
-                only allowed to servers on your local network — check the address \
-                points at your NAS's local IP.
-                """
-            case NSURLErrorCannotFindHost:
-                "That hostname couldn't be found. Check the address for typos."
-            case NSURLErrorCannotConnectToHost:
-                """
-                Nothing answered on that address and port. Check the server is \
-                running and that the port matches.
-                """
-            case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted:
-                """
-                The secure connection failed. If your server runs plain HTTP, put \
-                http:// at the front of the address.
-                """
-            case NSURLErrorTimedOut:
-                "The server didn't respond in time. Are you on the same network as it?"
-            case NSURLErrorNotConnectedToInternet:
-                "This device isn't on a network."
-            default:
-                error.localizedDescription
-            }
-        }
     }
 }
