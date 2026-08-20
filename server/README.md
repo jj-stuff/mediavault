@@ -46,6 +46,33 @@ Or, straight from the NAS container UI, pull `mediavault-server:latest` and set:
 | Volume | a folder for deletes → `/trash` |
 | Volume | a folder for the cache → `/cache/thumbs` |
 
+### Container starts then immediately exits
+
+Check the log. The server refuses to start without a password, and that is by far
+the most common cause:
+
+```
+======================================================================
+  MediaVault cannot start
+======================================================================
+  MEDIAVAULT_PASSWORD is not set.
+```
+
+Set `MEDIAVAULT_PASSWORD` and `MEDIAVAULT_SECRET_KEY` on the container and restart.
+NAS container UIs do not carry environment variables over from a compose file you
+imported — they have to be entered in the UI's own environment section.
+
+If instead the log ends in `address already in use`, something else on the box holds
+the port. Under **host networking there is no port mapping to remap**, so change the
+port the server itself binds:
+
+```
+MEDIAVAULT_BIND_PORT=8800
+```
+
+Then reach it at `http://<nas-ip>:8800`. In bridge mode, leave this alone and change
+the host side of the port mapping instead.
+
 ### Image visibility
 
 Both registries default to matching the source repo, which is private. Either sign

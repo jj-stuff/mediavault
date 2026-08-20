@@ -11,6 +11,11 @@ ENV PYTHONUNBUFFERED=1 \
     MEDIAVAULT_MEDIA_ROOT=/media \
     MEDIAVAULT_THUMB_CACHE=/cache/thumbs
 
+# Port uvicorn binds inside the container. Only worth changing under host
+# networking, where there is no port mapping to remap a conflict away and
+# something else on the NAS may already be holding 8000.
+ENV MEDIAVAULT_BIND_PORT=8000
+
 WORKDIR /srv
 
 COPY requirements.txt .
@@ -28,8 +33,11 @@ USER mediavault
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=4).status == 200 else 1)"
+    CMD python -c "import os,urllib.request,sys; p=os.environ.get('MEDIAVAULT_BIND_PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/', timeout=4).status == 200 else 1)"
 
+# Shell form so MEDIAVAULT_BIND_PORT is expanded at runtime; `exec` keeps uvicorn
+# as PID 1 so it still receives SIGTERM and shuts down cleanly.
+#
 # --factory: the app reads its config from the environment at call time, so nothing
 # is constructed at import and the module stays importable in tests.
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["sh", "-c", "exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port \"${MEDIAVAULT_BIND_PORT:-8000}\" --proxy-headers --forwarded-allow-ips '*'"]

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 # Must stay in sync with MediaItem.imageExtensions / videoExtensions in the iOS app.
 IMAGE_EXTENSIONS: frozenset[str] = frozenset(
@@ -22,6 +24,25 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 # Folder at the media root that deleted files are moved into. Skipped when scanning
 # so it never shows up as a profile.
 TRASH_DIR_NAME = "Trash"
+
+
+def _fail(*lines: str) -> NoReturn:
+    """Prints a readable startup failure and exits.
+
+    Deliberately not a bare `raise`: this runs inside uvicorn's app factory, so an
+    exception surfaces as a 40-line traceback whose actual cause is the very last
+    line — and NAS container UIs frequently show only the first lines, or truncate
+    the log entirely. A banner survives that.
+    """
+    width = 70
+    print("\n" + "=" * width, file=sys.stderr)
+    print("  MediaVault cannot start", file=sys.stderr)
+    print("=" * width, file=sys.stderr)
+    for line in lines:
+        print(f"  {line}" if line else "", file=sys.stderr)
+    print("=" * width + "\n", file=sys.stderr)
+    sys.stderr.flush()
+    raise SystemExit(1)
 
 
 def _env_path(name: str, default: str) -> Path:
@@ -64,9 +85,19 @@ class Settings:
     def from_env(cls) -> "Settings":
         password = os.environ.get("MEDIAVAULT_PASSWORD", "").strip()
         if not password:
-            raise RuntimeError(
-                "MEDIAVAULT_PASSWORD is not set. Refusing to start an unprotected "
-                "server that exposes your media library."
+            # Printed as a banner, not raised as a bare traceback: this runs inside
+            # uvicorn's factory, and a NAS container UI often shows only the last
+            # few log lines. The reason for exiting has to be unmissable.
+            _fail(
+                "MEDIAVAULT_PASSWORD is not set.",
+                "",
+                "The server will not start without one, because it would expose",
+                "your entire media library to anyone who can reach this port.",
+                "",
+                "Set it as an environment variable on the container:",
+                "",
+                "    MEDIAVAULT_PASSWORD=<the password you'll type in the app>",
+                "    MEDIAVAULT_SECRET_KEY=<32+ random characters>",
             )
 
         secret_key = os.environ.get("MEDIAVAULT_SECRET_KEY", "").strip()
