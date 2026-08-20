@@ -71,7 +71,9 @@ struct LoginWebView: UIViewRepresentable {
     let url: URL
     @Binding var failure: String?
 
-    func makeCoordinator() -> Coordinator { Coordinator(failure: $failure) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(failure: $failure, requestedURL: url)
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         // The default (persistent) data store, so the session survives app restarts
@@ -89,9 +91,11 @@ struct LoginWebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         private let failure: Binding<String?>
+        private let requestedURL: URL
 
-        init(failure: Binding<String?>) {
+        init(failure: Binding<String?>, requestedURL: URL) {
             self.failure = failure
+            self.requestedURL = requestedURL
         }
 
         /// Copies cookies out of the web view after each navigation, so they are in
@@ -113,7 +117,9 @@ struct LoginWebView: UIViewRepresentable {
             didFailProvisionalNavigation navigation: WKNavigation!,
             withError error: Error
         ) {
-            report(error)
+            // On a provisional failure `webView.url` is often nil, so fall back to
+            // the URL the sheet was asked to load.
+            report(error, url: webView.url ?? requestedURL)
         }
 
         func webView(
@@ -121,15 +127,17 @@ struct LoginWebView: UIViewRepresentable {
             didFail navigation: WKNavigation!,
             withError error: Error
         ) {
-            report(error)
+            // On a provisional failure `webView.url` is often nil, so fall back to
+            // the URL the sheet was asked to load.
+            report(error, url: webView.url ?? requestedURL)
         }
 
-        private func report(_ error: Error) {
+        private func report(_ error: Error, url: URL?) {
             // Cancellation is normal — a redirect supersedes the previous load.
             let nsError = error as NSError
             guard !(nsError.domain == NSURLErrorDomain
                     && nsError.code == NSURLErrorCancelled) else { return }
-            failure.wrappedValue = NetworkErrorMessage.explain(nsError)
+            failure.wrappedValue = NetworkErrorMessage.explain(nsError, url: url)
         }
 
     }

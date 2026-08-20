@@ -137,7 +137,7 @@ final class RemoteServerService {
             }
             isAuthenticated = code == 200
         } catch {
-            diagnosis = "Couldn't reach \(base.absoluteString)\n\n\(NetworkErrorMessage.explain(error))"
+            diagnosis = "Couldn't reach \(base.absoluteString)\n\n\(NetworkErrorMessage.explain(error, url: base))"
             isAuthenticated = false
         }
     }

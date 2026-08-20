@@ -8,7 +8,29 @@ import Foundation
 /// same cause the same way.
 nonisolated enum NetworkErrorMessage {
 
-    static func explain(_ error: Error) -> String {
+    /// - Parameter url: the address that failed, when known. A failure to reach a
+    ///   private address means something different from a failure to reach the
+    ///   public internet, and the advice differs accordingly.
+    static func explain(_ error: Error, url: URL? = nil) -> String {
+        let base = message(for: error)
+        guard let host = url?.host(), RemoteServerService.isLocalAddress(host) else {
+            return base
+        }
+        return base + "\n\n" + localNetworkHint
+    }
+
+    /// iOS 14+ requires explicit permission for *any* connection to a device on
+    /// the local network, and a denial fails exactly like an unreachable host —
+    /// silently, with no distinguishing error code. The same address working in
+    /// Safari is the giveaway: Safari is a system app and is not subject to it.
+    static let localNetworkHint = """
+        If this address works in Safari but not here, check \
+        Settings › Privacy & Security › Local Network and make sure MediaVault \
+        is switched on. If MediaVault isn't listed at all, delete the app and \
+        reinstall it so iOS asks again.
+        """
+
+    private static func message(for error: Error) -> String {
         let nsError = error as NSError
         guard nsError.domain == NSURLErrorDomain else { return nsError.localizedDescription }
 
