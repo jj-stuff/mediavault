@@ -4,21 +4,46 @@ services:
     image: mediavault-server
     container_name: mediavault
     restart: unless-stopped
+
     ports:
-      - "8000:8000"
+      # Host port on the left — change MEDIAVAULT_PORT in .env, not this line.
+      # The container always listens on 8000 internally.
+      - "${MEDIAVAULT_PORT:-8000}:8000"
+
     environment:
-      # Required. The app will not start without these.
       MEDIAVAULT_PASSWORD: ${MEDIAVAULT_PASSWORD:?set MEDIAVAULT_PASSWORD in .env}
       MEDIAVAULT_SECRET_KEY: ${MEDIAVAULT_SECRET_KEY:?set MEDIAVAULT_SECRET_KEY in .env}
-      # Set to 1 once a TLS reverse proxy is in front of this.
       MEDIAVAULT_HTTPS_ONLY: ${MEDIAVAULT_HTTPS_ONLY:-0}
       MEDIAVAULT_THUMB_SIZE: ${MEDIAVAULT_THUMB_SIZE:-400}
       MEDIAVAULT_SCAN_CACHE_TTL: ${MEDIAVAULT_SCAN_CACHE_TTL:-300}
+      # Deleted files land here. Kept off /media so it still works in the
+      # several-folders setup below, where /media itself is not a real volume.
+      MEDIAVAULT_TRASH_DIR: /trash
+
     volumes:
-      # Your library. Read-write, because the app moves deletes into <root>/Trash.
+      # ---------------------------------------------------------------------
+      # ONE folder that already contains a subfolder per person. The common case.
+      # ---------------------------------------------------------------------
       - ${MEDIAVAULT_MEDIA_DIR:?set MEDIAVAULT_MEDIA_DIR in .env}:/media
-      # Thumbnail cache. Named volume so it survives image rebuilds.
+
+      # ---------------------------------------------------------------------
+      # SEVERAL folders scattered around the host: comment out the line above,
+      # uncomment these, and map each one to a name under /media. Whatever you
+      # call it on the right is the profile name that shows up in the app.
+      #
+      #   - /mnt/ssd/photos/alice:/media/alice
+      #   - /mnt/nas/media/bob:/media/bob
+      #   - /srv/downloads/charlie:/media/charlie
+      #
+      # Add `:ro` to any of them to make it read-only — but then deleting from
+      # that folder in the app will fail, since a delete is a move out of it.
+      # ---------------------------------------------------------------------
+
+      # Trash and thumbnail cache. Both must be real volumes or you lose deleted
+      # files and re-render every thumbnail after each restart.
+      - ${MEDIAVAULT_TRASH_DIR:-mediavault_trash}:/trash
       - thumbs:/cache/thumbs
 
 volumes:
   thumbs:
+  mediavault_trash:

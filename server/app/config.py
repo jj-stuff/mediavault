@@ -48,6 +48,17 @@ class Settings:
     scan_cache_ttl: int
     thumb_size: int
     https_only: bool
+    #: Where deleted files go. `None` means `<media_root>/Trash`.
+    #:
+    #: Worth overriding when each profile is its own bind mount: in that setup
+    #: `/media` itself is the container's own filesystem, so a trash folder inside
+    #: it would be destroyed the next time the container is recreated — turning
+    #: "move to Trash" into a permanent delete.
+    trash_dir: Path | None = None
+
+    @property
+    def trash_root(self) -> Path:
+        return self.trash_dir or self.media_root / TRASH_DIR_NAME
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -68,8 +79,11 @@ class Settings:
                 "ephemeral key. Sessions will not survive a restart."
             )
 
+        trash_raw = os.environ.get("MEDIAVAULT_TRASH_DIR", "").strip()
+
         return cls(
             media_root=_env_path("MEDIAVAULT_MEDIA_ROOT", "/media"),
+            trash_dir=Path(trash_raw).expanduser() if trash_raw else None,
             password=password,
             secret_key=secret_key,
             thumb_cache_dir=_env_path("MEDIAVAULT_THUMB_CACHE", "/cache/thumbs"),

@@ -310,5 +310,56 @@ def test_delete_traversal_blocked(auth_client: TestClient) -> None:
     assert auth_client.delete("/api/media/../../etc/passwd").status_code == 404
 
 
+def test_trash_dir_can_live_outside_the_media_root(
+    media_root: Path, tmp_path: Path
+) -> None:
+    """The multi-mount setup needs this: when every profile is its own bind mount,
+    a trash folder inside /media would be lost when the container is recreated."""
+    external_trash = tmp_path / "external-trash"
+    settings = Settings(
+        media_root=media_root,
+        password=PASSWORD,
+        secret_key="test-secret-key",
+        thumb_cache_dir=tmp_path / "thumbs",
+        session_max_age=3600,
+        scan_cache_ttl=300,
+        thumb_size=200,
+        https_only=False,
+        trash_dir=external_trash,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        client.post("/login", data={"password": PASSWORD}, follow_redirects=False)
+        assert client.delete("/api/media/alice/beach/swim.jpg").status_code == 200
+
+    assert (external_trash / "alice" / "beach" / "swim.jpg").is_file()
+    assert not (media_root / "Trash").exists()
+
+
+def test_relocated_trash_inside_root_is_not_a_profile(
+    media_root: Path, tmp_path: Path
+) -> None:
+    inside_trash = media_root / "deleted"
+    settings = Settings(
+        media_root=media_root,
+        password=PASSWORD,
+        secret_key="test-secret-key",
+        thumb_cache_dir=tmp_path / "thumbs",
+        session_max_age=3600,
+        scan_cache_ttl=300,
+        thumb_size=200,
+        https_only=False,
+        trash_dir=inside_trash,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        client.post("/login", data={"password": PASSWORD}, follow_redirects=False)
+        client.delete("/api/media/alice/cover.jpg")
+        ids = [p["id"] for p in client.get("/api/profiles").json()["profiles"]]
+
+    assert (inside_trash / "alice" / "cover.jpg").is_file()
+    assert "deleted" not in ids
+
+
 def test_delete_missing_file_404(auth_client: TestClient) -> None:
     assert auth_client.delete("/api/media/alice/nope.jpg").status_code == 404

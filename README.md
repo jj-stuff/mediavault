@@ -77,11 +77,29 @@ Changing one means changing the other.
 
 ## The server
 
-See [`server/README.md`](server/README.md) for configuration, the full API, and
-home-server deployment notes.
+Only `server/` is sent to Docker — the build context is that folder, so `app/` never
+enters the image. Clone the repo anywhere on the host and work from `server/`:
 
 ```bash
-cd server
-cp .env.example .env    # set media dir, password, secret key
+git clone git@github.com:jj-stuff/mediavault.git
+cd mediavault/server
+
+cp .env.example .env
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # paste as SECRET_KEY
+$EDITOR .env                # set MEDIAVAULT_MEDIA_DIR, PASSWORD, SECRET_KEY, PORT
+
 docker compose up -d
+docker compose logs -f      # confirm it found your media
 ```
+
+Then point the app at `http://<host-ip>:<port>` under **Settings → Remote Server**.
+
+- **Port**: set `MEDIAVAULT_PORT` in `.env`; the container always listens on 8000
+  internally.
+- **Several source folders**: `compose.yml` has a commented multi-mount block —
+  map each host folder to a name under `/media`, and that name becomes the profile.
+- **Deletes** are moves into a trash volume, never unlinks. Keep it on a real
+  volume; the server prints its location on every boot.
+
+Full configuration, the API reference, and reverse-proxy notes are in
+[`server/README.md`](server/README.md).

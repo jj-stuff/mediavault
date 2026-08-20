@@ -27,7 +27,7 @@ from pydantic.alias_generators import to_camel
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import auth, media, thumbs
-from .config import TRASH_DIR_NAME, Settings
+from .config import Settings
 from .library import LibraryCache, Profile
 from .paths import UnsafePathError, resolve_under_root
 
@@ -90,6 +90,11 @@ async def lifespan(app: FastAPI):
         )
     else:
         print(f"[mediavault] serving {settings.media_root}")
+
+    # Printed on every boot on purpose. If this path is not on a mounted volume,
+    # deleted files are written into the container's own filesystem and are gone
+    # the next time it is recreated.
+    print(f"[mediavault] deleted files go to {settings.trash_root}")
     yield
 
 
@@ -191,7 +196,7 @@ def _api_router():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
         destination = await run_in_threadpool(
-            _move_to_trash, settings.media_root, target, path
+            _move_to_trash, settings.trash_root, target, path
         )
         _library(request).invalidate()
         return {"status": "trashed", "path": destination}
@@ -199,13 +204,12 @@ def _api_router():
     return router
 
 
-def _move_to_trash(root: Path, source: Path, relative: str) -> str:
-    """Moves a file into <root>/Trash, preserving its folder structure.
+def _move_to_trash(trash_root: Path, source: Path, relative: str) -> str:
+    """Moves a file into the trash, preserving its folder structure.
 
     Keeping the relative path means `alice/1.jpg` and `bob/1.jpg` do not collide,
     and a mistaken delete can be put back where it came from.
     """
-    trash_root = root / TRASH_DIR_NAME
     destination = trash_root / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -218,4 +222,4 @@ def _move_to_trash(root: Path, source: Path, relative: str) -> str:
     # shutil.move rather than Path.rename: the trash may be on a different filesystem
     # from the media itself when the library spans mounts.
     shutil.move(str(source), str(destination))
-    return destination.relative_to(root).as_posix()
+    return destination.relative_to(trash_root).as_posix()

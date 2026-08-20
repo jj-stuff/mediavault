@@ -13,35 +13,116 @@ media root becomes a profile.
 └── Trash/            → deletes land here; never shown as a profile
 ```
 
-## Running it
+## Running it with Docker
+
+Only the `server/` folder is ever sent to Docker — the build context is this
+directory, so the iOS app in `app/` never enters the image. Run every command below
+from `server/`.
 
 ```bash
+git clone git@github.com:jj-stuff/mediavault.git
+cd mediavault/server
+
 cp .env.example .env
-# edit .env: set MEDIAVAULT_MEDIA_DIR, MEDIAVAULT_PASSWORD, MEDIAVAULT_SECRET_KEY
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # paste as SECRET_KEY
+$EDITOR .env
+
 docker compose up -d
+docker compose logs -f          # confirm it found your media
 ```
 
-Generate a secret key with:
+Check it is alive, then point the app at `http://<host-ip>:<port>`:
 
 ```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+curl -I http://localhost:8000/   # expect 200
 ```
 
-Then in the iOS app: **Settings → Remote Server → on**, enter the server URL, tap
-**Sign In**, enter the password, tap **Done**.
+In the app: **Settings → Remote Server → on**, enter the URL, **Sign In**, enter the
+password, **Done**.
+
+Everyday operations:
+
+```bash
+docker compose restart              # after changing .env
+docker compose up -d --build        # after pulling new code
+docker compose down                 # stop (volumes survive)
+docker compose logs --tail=50       # recent output
+```
+
+### Choosing the port
+
+Set `MEDIAVAULT_PORT` in `.env` and restart. The container always listens on 8000
+internally; only the host side changes, so nothing else needs touching.
+
+```bash
+MEDIAVAULT_PORT=9000
+```
+
+### Pointing at one folder vs several
+
+**One folder that already holds a subfolder per person** — the normal case. Set
+`MEDIAVAULT_MEDIA_DIR` and you are done:
+
+```bash
+MEDIAVAULT_MEDIA_DIR=/srv/media
+```
+
+```
+/srv/media/alice/…      → profile "alice"
+/srv/media/bob/…        → profile "bob"
+```
+
+**Several folders scattered around the host.** Comment out the single `- ${MEDIAVAULT_MEDIA_DIR}:/media`
+line in `compose.yml` and uncomment the multi-mount block, mapping each host folder
+to a name under `/media`. The name on the right becomes the profile name:
+
+```yaml
+volumes:
+  - /mnt/ssd/photos/alice:/media/alice
+  - /mnt/nas/media/bob:/media/bob
+  - /srv/downloads/charlie:/media/charlie
+```
+
+Append `:ro` to any mount to keep it read-only — but deleting from that folder in
+the app will then fail, because a delete is a move out of it.
+
+### Where deleted files go
+
+Deletes are moves into a trash folder, never unlinks. By default that is a Docker
+named volume mounted at `/trash`, which survives restarts. To keep it browsable from
+the host, point it at a real path:
+
+```bash
+MEDIAVAULT_TRASH_DIR=/srv/media-trash
+```
+
+The trash is deliberately kept off `/media`. In the several-folders setup above,
+`/media` itself is not a mounted volume — it is the container's own filesystem — so a
+trash folder inside it would be destroyed the next time the container is recreated,
+turning every "move to Trash" into a permanent delete.
+
+The server prints its trash location on every boot. Check it in `docker compose logs`
+before you rely on deletes.
 
 ### File ownership
 
 The container runs as uid 1000. That user needs read access to your library, and
-write access for deletes to work. If your NAS uses a different uid, either adjust the
-ownership of the media folder or add `user: "<uid>:<gid>"` to the service in
-`compose.yml`.
+write access wherever the trash lives. If your NAS uses a different uid, either
+adjust ownership of the media folder or pin the container to your uid:
+
+```yaml
+services:
+  mediavault:
+    user: "1027:100"    # your uid:gid, from `id -u` / `id -g`
+```
+
+Symptom of getting this wrong: browsing works, deletes fail with a permission error.
 
 ### Exposing it beyond your LAN
 
 Put a TLS-terminating reverse proxy in front of it and set `MEDIAVAULT_HTTPS_ONLY=1`
 so the session cookie is marked Secure. The container already trusts
-`X-Forwarded-*`. Do not expose port 8000 directly — the session cookie would travel
+`X-Forwarded-*`. Do not expose the port directly — the session cookie would travel
 in the clear, and it is the only thing protecting your library.
 
 ## Configuration
@@ -50,6 +131,9 @@ in the clear, and it is the only thing protecting your library.
 |---|---|---|
 | `MEDIAVAULT_PASSWORD` | — | **Required.** Sign-in password. The server refuses to start without it. |
 | `MEDIAVAULT_SECRET_KEY` | random | Signs the session cookie. Unset means sessions die on restart. |
+| `MEDIAVAULT_PORT` | `8000` | Host port. The container always listens on 8000 inside. |
+| `MEDIAVAULT_MEDIA_DIR` | — | Host path to your library, mounted at `/media`. |
+| `MEDIAVAULT_TRASH_DIR` | named volume | Where deletes go. A host path keeps them browsable. |
 | `MEDIAVAULT_MEDIA_ROOT` | `/media` | Library path *inside* the container. |
 | `MEDIAVAULT_THUMB_CACHE` | `/cache/thumbs` | Thumbnail cache path inside the container. |
 | `MEDIAVAULT_SESSION_MAX_AGE` | `2592000` | Session lifetime in seconds (30 days). |

@@ -114,16 +114,20 @@ def _scan_profile(folder: Path, root: Path) -> Profile:
     return profile
 
 
-def scan(root: Path) -> list[Profile]:
+def scan(root: Path, trash_root: Path | None = None) -> list[Profile]:
     """Full scan of the media root. Profiles with no media are omitted."""
     if not root.is_dir():
         return []
+
+    # Compared by resolved path, not by name: the trash can be relocated, and when
+    # it lives outside the media root there is nothing to exclude at all.
+    excluded = (trash_root or root / TRASH_DIR_NAME).resolve()
 
     profiles: list[Profile] = []
     for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not entry.is_dir() or _is_hidden(entry):
             continue
-        if entry.name == TRASH_DIR_NAME:
+        if entry.resolve() == excluded:
             continue
         profile = _scan_profile(entry, root)
         if profile.items:
@@ -152,7 +156,10 @@ class LibraryCache:
             age = time.monotonic() - self._scanned_at
             stale = self._profiles is None or age > self._settings.scan_cache_ttl
             if force or stale:
-                self._profiles = scan(self._settings.media_root)
+                self._profiles = scan(
+                    self._settings.media_root,
+                    trash_root=self._settings.trash_root,
+                )
                 self._scanned_at = time.monotonic()
             return self._profiles or []
 
