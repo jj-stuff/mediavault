@@ -31,17 +31,49 @@ final class RemoteServerService {
 
     // MARK: - URLs
 
-    /// Normalised base URL, e.g. `https://vault.example.com`.
+    /// Normalised base URL, e.g. `https://vault.example.com` or `http://192.168.1.4:8000`.
+    ///
+    /// When the address has no scheme, one is inferred: `http` for a LAN address,
+    /// `https` for anything else. Always assuming `https` meant that typing a NAS's
+    /// IP produced a TLS handshake against a plain-HTTP port, which fails in a way
+    /// that looks like the server is down.
     var baseURL: URL? {
         guard isEnabled else { return nil }
         var trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
         if !trimmed.hasPrefix("http://") && !trimmed.hasPrefix("https://") {
-            trimmed = "https://" + trimmed
+            trimmed = (Self.isLocalAddress(trimmed) ? "http://" : "https://") + trimmed
         }
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
         return URL(string: trimmed)
+    }
+
+    /// True for addresses on the local network, where plain HTTP is both expected
+    /// and permitted by the app's `NSAllowsLocalNetworking` exception.
+    nonisolated static func isLocalAddress(_ address: String) -> Bool {
+        // Strip any path and port to get at the bare host.
+        let host = address
+            .split(separator: "/", maxSplits: 1).first
+            .map(String.init)?
+            .split(separator: ":").first
+            .map(String.init) ?? address
+
+        let lowered = host.lowercased()
+        if lowered == "localhost" || lowered.hasSuffix(".local") { return true }
+
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else {
+            return false
+        }
+
+        // RFC 1918 private ranges, loopback, and link-local.
+        return switch (octets[0], octets[1]) {
+        case (10, _), (127, _), (192, 168): true
+        case (172, 16...31): true
+        case (169, 254): true
+        default: false
+        }
     }
 
     /// Root used for relative-path resolution throughout the app in remote mode.

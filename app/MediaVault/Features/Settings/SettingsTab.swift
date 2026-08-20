@@ -59,7 +59,7 @@ struct SettingsTab: View {
             }
 
             if remote.isEnabled {
-                TextField("https://your-server.com", text: $remote.serverURL)
+                TextField("192.168.1.10:8000", text: $remote.serverURL)
                     .keyboardType(.URL)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
@@ -88,7 +88,7 @@ struct SettingsTab: View {
         } header: {
             Text("Remote Server")
         } footer: {
-            Text("Connect to a MediaVault server over the network. Sign in through the web page to authenticate.")
+            Text("Connect to a MediaVault server over the network, then sign in through the web page. A local address like 192.168.1.10:8000 is reached over HTTP; anything else uses HTTPS.")
         }
     }
 

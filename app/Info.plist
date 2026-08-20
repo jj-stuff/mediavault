@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  A self-hosted server on the LAN is reached over plain HTTP at a private
+	  address. Two separate iOS restrictions block that by default, and both fail
+	  silently — a WKWebView just renders white.
+
+	  NSAllowsLocalNetworking permits cleartext to link-local and private IP
+	  ranges only. It is deliberately not NSAllowsArbitraryLoads: connections to
+	  the public internet still require TLS, so exposing the server through a
+	  reverse proxy stays as safe as it was.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!--
+	  Required since iOS 14 for any connection to a device on the local network.
+	  Without this key the system denies access without even prompting.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MediaVault connects to your MediaVault server on this network to browse your media library.</string>
+</dict>
+</plist>
