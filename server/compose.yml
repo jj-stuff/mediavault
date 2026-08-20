@@ -1,0 +1,24 @@
+services:
+  mediavault:
+    build: .
+    image: mediavault-server
+    container_name: mediavault
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Required. The app will not start without these.
+      MEDIAVAULT_PASSWORD: ${MEDIAVAULT_PASSWORD:?set MEDIAVAULT_PASSWORD in .env}
+      MEDIAVAULT_SECRET_KEY: ${MEDIAVAULT_SECRET_KEY:?set MEDIAVAULT_SECRET_KEY in .env}
+      # Set to 1 once a TLS reverse proxy is in front of this.
+      MEDIAVAULT_HTTPS_ONLY: ${MEDIAVAULT_HTTPS_ONLY:-0}
+      MEDIAVAULT_THUMB_SIZE: ${MEDIAVAULT_THUMB_SIZE:-400}
+      MEDIAVAULT_SCAN_CACHE_TTL: ${MEDIAVAULT_SCAN_CACHE_TTL:-300}
+    volumes:
+      # Your library. Read-write, because the app moves deletes into <root>/Trash.
+      - ${MEDIAVAULT_MEDIA_DIR:?set MEDIAVAULT_MEDIA_DIR in .env}:/media
+      # Thumbnail cache. Named volume so it survives image rebuilds.
+      - thumbs:/cache/thumbs
+
+volumes:
+  thumbs:
