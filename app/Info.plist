@@ -3,17 +3,32 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  A self-hosted server on the LAN is reached over plain HTTP at a private
-	  address. Two separate iOS restrictions block that by default, and both fail
-	  silently — a WKWebView just renders white.
+	  App Transport Security is relaxed so the app can talk to a self-hosted
+	  server over plain HTTP on the local network.
 
-	  NSAllowsLocalNetworking permits cleartext to link-local and private IP
-	  ranges only. It is deliberately not NSAllowsArbitraryLoads: connections to
-	  the public internet still require TLS, so exposing the server through a
-	  reverse proxy stays as safe as it was.
+	  NSAllowsLocalNetworking alone is not enough, which is easy to get wrong:
+	  Apple's local-networking exception covers only dotless hostnames, .local
+	  domains, and *link-local* addresses (169.254.0.0/16, fe80::/10). A NAS at
+	  an RFC 1918 address like 192.168.1.10 is not covered, and ATS blocks it.
+
+	  NSExceptionDomains cannot fill the gap either: it takes domain names, not
+	  IP literals, and the server's address is whatever the user types at
+	  runtime — there is nothing to declare ahead of time.
+
+	  That leaves NSAllowsArbitraryLoads. The trade-off is real: it disables
+	  TLS enforcement for every connection the app makes, not just LAN ones.
+	  It is acceptable here only because the app has exactly one network peer —
+	  the user's own MediaVault server — and contacts nothing else. If that ever
+	  stops being true, this needs revisiting.
+
+	  NSAllowsLocalNetworking is kept alongside it: it is honoured for .local
+	  hostnames, so pointing the app at `nas.local:8000` stays on the narrow
+	  path rather than relying on the blanket exception.
 	-->
 	<key>NSAppTransportSecurity</key>
 	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
