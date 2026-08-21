@@ -45,6 +45,31 @@ final class MediaDeletionService {
         likes.unlike(mediaItem: item, rootURL: rootURL)
     }
 
+    /// Deletes several items, and reports what did not go.
+    ///
+    /// Unlike the single-item `delete`, this does not throw: a selection of two
+    /// hundred photos where one file has already been moved on the NAS should lose
+    /// the other hundred and ninety-nine anyway, and then say what was left behind.
+    ///
+    /// Sequential on purpose. Each delete finishes by editing the scanner's library
+    /// and the like list, and running them concurrently would interleave those edits
+    /// for no gain: the disk, and the server, do one move at a time regardless.
+    func delete(_ items: [MediaItem], rootURL: URL?) async -> BatchOutcome {
+        var deleted = 0
+        var failures: [String] = []
+
+        for item in items {
+            do {
+                try await delete(item, rootURL: rootURL)
+                deleted += 1
+            } catch {
+                failures.append("\(item.fileName): \(error.localizedDescription)")
+            }
+        }
+
+        return BatchOutcome(deletedCount: deleted, failures: failures)
+    }
+
     // MARK: - Remote
 
     private func deleteRemote(_ item: MediaItem, rootURL: URL) async throws {
@@ -59,11 +84,15 @@ final class MediaDeletionService {
 
     // MARK: - Local
 
-    /// Moves the file into `<root>/Trash/<original/sub/path>`, off the main actor.
+    /// Moves the file into `<root>/Trash/<original/sub/path>`, off the main actor,
+    /// falling back to an outright delete when the trash cannot be written.
     ///
     /// The original folder structure is preserved so `alice/1.jpg` and `bob/1.jpg`
     /// do not collide, and so a mistaken delete can be put back where it came from.
-    /// This mirrors `_move_to_trash` on the server.
+    /// This mirrors `_dispose` on the server, including the fallback: a read-only
+    /// volume or a folder owned by someone else cannot have a `Trash` directory
+    /// created inside it, and failing there means the delete the user confirmed
+    /// twice simply does not happen. Deleting is what they asked for either way.
     @concurrent
     private func moveToTrash(_ item: MediaItem, rootURL: URL) async throws {
         guard let relativePath = MediaPath.strictRelative(for: item.url, under: rootURL) else {
@@ -85,7 +114,14 @@ final class MediaDeletionService {
                 to: Self.availableURL(for: destination, fileManager: fileManager)
             )
         } catch {
-            throw DeletionError.moveFailed(error)
+            AppLog.library.notice(
+                "trash unavailable (\(error.localizedDescription, privacy: .public)); deleting outright"
+            )
+            do {
+                try fileManager.removeItem(at: item.url)
+            } catch {
+                throw DeletionError.moveFailed(error)
+            }
         }
     }
 
@@ -109,6 +145,29 @@ final class MediaDeletionService {
             let candidate = folder.appending(path: name)
             if !fileManager.fileExists(atPath: candidate.path) { return candidate }
             counter += 1
+        }
+    }
+}
+
+// MARK: - Results
+
+extension MediaDeletionService {
+    /// What a multi-item delete managed.
+    struct BatchOutcome: Sendable {
+        let deletedCount: Int
+        /// One line per item that could not be deleted, already user-readable.
+        let failures: [String]
+
+        /// Nil when everything went, so a caller can present it or not without
+        /// counting anything itself.
+        var failureMessage: String? {
+            guard !failures.isEmpty else { return nil }
+            let heading = failures.count == 1
+                ? "1 item could not be deleted."
+                : "\(failures.count) items could not be deleted."
+            // Capped: an alert listing two hundred failures is not readable, and the
+            // reason is nearly always the same one repeated.
+            return ([heading] + failures.prefix(5)).joined(separator: "\n")
         }
     }
 }

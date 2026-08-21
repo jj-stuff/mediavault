@@ -15,17 +15,26 @@ profile, and folders below that are its subfolders.
 ## The app
 
 - **Profiles** — Instagram-style grid, one profile per subfolder, with type and
-  subfolder filters.
+  subfolder filters, and sorting by name, date, or size. Pull down to rescan.
 - **For You** — vertical paging feed that spreads items so the same profile does not
   appear twice in a row. Players for the next items are prepared before you reach
-  them, so swiping does not stall on buffering.
+  them, so swiping does not stall on buffering. Pull down on the first item to
+  reshuffle.
 - **Liked** — favourites stored in the app as paths relative to the library root, so
   source folders stay read-only and likes survive the root moving.
 - **Settings** — pick a local folder (including external drives) or point the app at
-  a MediaVault server.
+  a MediaVault server, and choose which folder on that server your profiles come
+  from: a server serving `/media` can be browsed as `media/peeps` or `media/peeps2`
+  without touching its configuration.
 
-Deletes are moves: a file goes to `Trash/<its original subpath>` in the library,
-never an unlink.
+Any grid — a profile, one of its subfolders, or Liked — has a **Select** button, and
+a long press on a photo starts the same mode. Ticked items go to the Trash together;
+in Liked they can also just be unliked, which leaves the files alone.
+
+Deletes are moves: a file goes to `Trash/<its original subpath>` in the library.
+When the library has nowhere writable for a `Trash` folder — a read-only volume, a
+server whose container runs as a different user — the file is deleted outright
+rather than the delete failing.
 
 ### Requirements
 
@@ -63,6 +72,19 @@ Some choices worth knowing before changing things:
   rebuild rows rather than recycling them, so `FeedPlayerPool` holds a window of
   `AVPlayer`s around the current item. That, not view recycling, is what makes the
   feed smooth.
+- **The feed is addressed by slot, not by file.** It repeats content deliberately
+  once a small library runs out, so the same `MediaItem` occupies several positions.
+  `FeedEntry` gives each position its own id; `MediaItem.id` still identifies the
+  file. Keying rows on the file instead is what made `scrollPosition` resolve a
+  later repeat back to the first copy — the wrong video playing, and paging that
+  would not snap.
+- **Only one player is ever audible.** `FeedPlayerPool.suspend()` covers every way
+  the feed can stop being what the user is looking at — another tab, a profile
+  sheet on top of it, the app backgrounding — without forgetting the position, and
+  the paged viewer plays only its current page.
+- **`AppLog` over `print`.** `os.Logger`, one category per area. Filter the Xcode
+  console on `subsystem:com.mediavault.app`, and add `category:playback` to watch
+  the player pool decide what plays.
 - **Deletion is one service.** `MediaDeletionService` owns the local and remote
   paths and reconciles the scanner and the like list afterwards.
 - **Paths compare through `MediaPath`.** The same item is addressed as a file URL, as

@@ -2,7 +2,7 @@ import AVFoundation
 import SwiftUI
 
 struct FeedItemView: View {
-    let item: MediaItem
+    let entry: FeedEntry
     let isActive: Bool
 
     @Environment(LikesService.self) private var likes
@@ -20,9 +20,11 @@ struct FeedItemView: View {
     @State private var showProfile = false
     @State private var deleteError: String?
 
+    private var item: MediaItem { entry.item }
+
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color.black
 
             switch item.mediaType {
             case .image: imageView
@@ -30,6 +32,12 @@ struct FeedItemView: View {
             }
 
             overlay
+        }
+        // A sheet does not take the feed off screen, so nothing else pauses it:
+        // the video kept playing underneath, and any video opened from the profile
+        // played on top of it. That is the "double audio" you could swipe away from.
+        .onChange(of: showProfile) { _, presented in
+            presented ? playerPool.suspend() : playerPool.resume()
         }
         .confirmationDialog(
             "Move \"\(item.fileName)\" to Trash?",
@@ -41,7 +49,7 @@ struct FeedItemView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The file is moved to the Trash folder, not erased.")
+            Text("The file is moved to the Trash folder, or deleted outright if the library has no writable Trash.")
         }
         .alert("Delete Failed", isPresented: .constant(deleteError != nil)) {
             Button("OK") { deleteError = nil }
@@ -51,7 +59,7 @@ struct FeedItemView: View {
         .sheet(isPresented: $showProfile) {
             if let profile = scanner.profiles.first(where: { $0.id == item.profileID }) {
                 NavigationStack {
-                    ProfileDetailView(profile: profile)
+                    ProfileDetailView(pushedProfile: profile)
                 }
             }
         }
@@ -70,7 +78,7 @@ struct FeedItemView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: item.id) {
+        .task(id: entry.id) {
             image = await imageLoader.fullImage(
                 for: item.url,
                 maxDimension: ImageLoader.feedImageMaxDimension
@@ -83,18 +91,17 @@ struct FeedItemView: View {
 
     private var videoView: some View {
         Group {
-            if let player = playerPool.player(for: item) {
+            if let player = playerPool.player(for: entry) {
                 FeedVideoPlayerView(
                     player: player,
                     videoGravity: isLandscapeMedia ? .resizeAspect : .resizeAspectFill
                 )
-                .ignoresSafeArea()
             } else {
                 // Only shows if the user outran the preload window.
                 ProgressView().tint(.white)
             }
         }
-        .task(id: item.id) {
+        .task(id: entry.id) {
             isLandscapeMedia = await Self.isLandscape(url: item.url)
         }
     }
@@ -117,8 +124,22 @@ struct FeedItemView: View {
     private var overlay: some View {
         VStack(spacing: 0) {
             header
-            Spacer()
+            Spacer(minLength: 0)
             actions
+            scrubber
+        }
+        // The feed ignores the safe area, so these have to be spelled out or the
+        // overlay lands under the Dynamic Island and behind the tab bar.
+        .padding(.bottom, ScreenInsets.feedBottomClearance)
+    }
+
+    @ViewBuilder
+    private var scrubber: some View {
+        // Only the slot on screen gets a scrubber: its poll would otherwise keep
+        // running for the buffered neighbours either side.
+        if isActive, item.mediaType == .video, let player = playerPool.player(for: entry) {
+            FeedScrubBar(player: player)
+                .padding(.top, 10)
         }
     }
 
@@ -149,8 +170,8 @@ struct FeedItemView: View {
             Spacer()
         }
         .padding(.horizontal)
-        .safeAreaPadding(.top)
-        .padding(.top, 32)
+        .padding(.top, ScreenInsets.top + 8)
+        .padding(.bottom, 12)
         .background(
             LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom)
         )
@@ -192,7 +213,6 @@ struct FeedItemView: View {
             }
         }
         .padding(.horizontal)
-        .padding(.bottom, 80)
     }
 
     private func circleButton(
@@ -221,8 +241,9 @@ struct FeedItemView: View {
     private func delete() async {
         do {
             try await deletion.delete(item, rootURL: library.activeRootURL)
-            feed.remove(id: item.id)
+            feed.removeItem(id: item.id)
         } catch {
+            AppLog.library.error("delete failed: \(error.localizedDescription, privacy: .public)")
             deleteError = error.localizedDescription
         }
     }

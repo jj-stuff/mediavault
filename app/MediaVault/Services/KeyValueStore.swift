@@ -33,5 +33,8 @@ nonisolated enum StorageKey {
     static let folderBookmark = "selectedFolderBookmark"
     static let remoteEnabled = "remoteEnabled"
     static let remoteServerURL = "remoteServerURL"
+    static let remoteLibraryRoot = "remoteLibraryRoot"
     static let flattenFolders = "flattenFolders"
+    static let mediaSortOrder = "mediaSortOrder"
+    static let profileSortOrder = "profileSortOrder"
 }

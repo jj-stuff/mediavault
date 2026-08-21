@@ -40,6 +40,11 @@ final class ImageLoader {
 
     private let urlSession: URLSession
 
+    /// Decodes currently running, keyed by URL, so the same file is never decoded
+    /// twice concurrently. `@ObservationIgnored` because nothing observes it and an
+    /// observed dictionary would invalidate every view on each prefetch.
+    @ObservationIgnored private var inFlightFullImages: [URL: Task<UIImage?, Never>] = [:]
+
     init(urlSession: URLSession = .shared) {
         self.urlSession = urlSession
     }
@@ -60,23 +65,65 @@ final class ImageLoader {
         return image
     }
 
+    /// Thumbnail already in memory, or `nil`. Synchronous on purpose: a view that
+    /// can answer "what do I draw right now" without awaiting draws something on its
+    /// very first frame instead of flashing a placeholder for one.
+    func cachedThumbnail(for url: URL) -> UIImage? {
+        thumbnailCache.object(forKey: url as NSURL)
+    }
+
     // MARK: - Full-size images
+
+    /// Full-size image already in memory, or `nil`. Same reason as
+    /// `cachedThumbnail(for:)`: paging back to a photo you just looked at should
+    /// not go through an await, because an await costs a frame of blank screen.
+    func cachedFullImage(for url: URL) -> UIImage? {
+        fullImageCache.object(forKey: url as NSURL)
+    }
 
     func fullImage(
         for url: URL,
         maxDimension: CGFloat = ImageLoader.fullImageMaxDimension
     ) async -> UIImage? {
-        let key = url as NSURL
-        if let cached = fullImageCache.object(forKey: key) { return cached }
+        if let cached = cachedFullImage(for: url) { return cached }
 
-        let image: UIImage? = if url.isFileURL {
-            await Self.downsample(url: url, maxDimension: maxDimension)
-        } else {
-            await remoteImage(at: url, maxDimension: maxDimension)
+        // Two callers routinely ask for the same image at the same time: the page
+        // the user just landed on, and the prefetch that was already warming it.
+        // Without this they decode the same multi-megapixel file twice, and the
+        // second decode competes with the one the screen is waiting for.
+        if let existing = inFlightFullImages[url] { return await existing.value }
+
+        let task = Task { [weak self] () -> UIImage? in
+            guard let self else { return nil }
+            return if url.isFileURL {
+                await Self.downsample(url: url, maxDimension: maxDimension)
+            } else {
+                await self.remoteImage(at: url, maxDimension: maxDimension)
+            }
         }
+        inFlightFullImages[url] = task
 
-        if let image { fullImageCache.setObject(image, forKey: key, cost: image.byteCount) }
+        let image = await task.value
+        inFlightFullImages[url] = nil
+
+        if let image {
+            fullImageCache.setObject(image, forKey: url as NSURL, cost: image.byteCount)
+        }
         return image
+    }
+
+    /// Decodes the full-size images for `items` into the cache without waiting.
+    ///
+    /// The viewer calls this for the pages either side of the current one, so a
+    /// swipe lands on a decoded image rather than on a spinner. Videos are skipped:
+    /// asking for a "full image" of a remote clip would download the whole file.
+    func prefetchFullImages(for items: [MediaItem]) {
+        for item in items where item.mediaType == .image {
+            guard cachedFullImage(for: item.url) == nil,
+                  inFlightFullImages[item.url] == nil
+            else { continue }
+            Task { _ = await fullImage(for: item.url) }
+        }
     }
 
     func clearCache() {

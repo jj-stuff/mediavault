@@ -12,6 +12,15 @@ nonisolated struct MediaProfile: Identifiable, Hashable, Sendable {
     var videoCount: Int { mediaItems.count { $0.mediaType == .video } }
     var totalCount: Int { mediaItems.count }
 
+    /// Aggregates used to sort the profile list itself.
+    var totalByteSize: Int64 {
+        mediaItems.reduce(0) { $0 + ($1.byteSize ?? 0) }
+    }
+
+    var lastModified: Date? {
+        mediaItems.compactMap(\.modifiedAt).max()
+    }
+
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: MediaProfile, rhs: MediaProfile) -> Bool { lhs.id == rhs.id }
 

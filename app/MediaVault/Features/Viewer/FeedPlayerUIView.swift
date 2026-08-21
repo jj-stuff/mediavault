@@ -5,6 +5,10 @@ import UIKit
 ///
 /// Backing the layer directly avoids a second layer to keep in sync and means the
 /// player surface resizes with the view for free.
+///
+/// It used to also own a progress bar pinned to its bottom edge. That bar has moved
+/// out to `FeedScrubBar` in the SwiftUI overlay: down here it was below the tab bar
+/// and the home indicator, and a `UIProgressView` cannot be dragged anyway.
 final class FeedPlayerUIView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
@@ -13,26 +17,10 @@ final class FeedPlayerUIView: UIView {
         layer as! AVPlayerLayer
     }
 
-    let progressBar: UIProgressView = {
-        let bar = UIProgressView(progressViewStyle: .default)
-        bar.trackTintColor = UIColor.white.withAlphaComponent(0.2)
-        bar.progressTintColor = .white
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        return bar
-    }()
-
     init(player: AVPlayer) {
         super.init(frame: .zero)
         backgroundColor = .black
         playerLayer.player = player
-
-        addSubview(progressBar)
-        NSLayoutConstraint.activate([
-            progressBar.leadingAnchor.constraint(equalTo: leadingAnchor),
-            progressBar.trailingAnchor.constraint(equalTo: trailingAnchor),
-            progressBar.bottomAnchor.constraint(equalTo: bottomAnchor),
-            progressBar.heightAnchor.constraint(equalToConstant: 2)
-        ])
     }
 
     required init?(coder: NSCoder) {

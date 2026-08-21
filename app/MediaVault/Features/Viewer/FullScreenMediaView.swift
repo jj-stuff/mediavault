@@ -6,6 +6,7 @@ struct FullScreenMediaView: View {
     @Environment(LikesService.self) private var likes
     @Environment(MediaDeletionService.self) private var deletion
     @Environment(LibraryController.self) private var library
+    @Environment(ImageLoader.self) private var imageLoader
     @Environment(\.dismiss) private var dismiss
 
     @State private var items: [MediaItem]
@@ -13,10 +14,14 @@ struct FullScreenMediaView: View {
     ///
     /// With an index, deleting an item shifts every item after it by one, so the
     /// selection silently jumps to a different photo than the one on screen.
-    @State private var currentID: UUID
+    /// Optional because that is what `scrollPosition(id:)` binds to.
+    @State private var currentID: UUID?
     @State private var showOverlay = true
     @State private var showDeleteConfirmation = false
     @State private var deleteError: String?
+
+    /// How many pages either side of the current one are decoded ahead of time.
+    private static let prefetchRadius = 2
 
     init(items: [MediaItem], initialItem: MediaItem) {
         self.initialItem = initialItem
@@ -36,14 +41,7 @@ struct FullScreenMediaView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            TabView(selection: $currentID) {
-                ForEach(items) { item in
-                    MediaContentView(item: item, showOverlay: $showOverlay)
-                        .tag(item.id)
-                }
-            }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            .ignoresSafeArea()
+            pager
 
             if showOverlay {
                 overlayControls
@@ -53,6 +51,8 @@ struct FullScreenMediaView: View {
         .statusBarHidden(!showOverlay)
         .preferredColorScheme(.dark)
         .animation(.easeInOut(duration: 0.2), value: showOverlay)
+        .onChange(of: currentID) { prefetchAroundCurrentPage() }
+        .onAppear { prefetchAroundCurrentPage() }
         .confirmationDialog(
             "Move \"\(currentItem?.fileName ?? "")\" to Trash?",
             isPresented: $showDeleteConfirmation,
@@ -63,12 +63,65 @@ struct FullScreenMediaView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The file is moved to the Trash folder, not erased.")
+            Text("The file is moved to the Trash folder, or deleted outright if the library has no writable Trash.")
         }
         .alert("Delete Failed", isPresented: .constant(deleteError != nil)) {
             Button("OK") { deleteError = nil }
         } message: {
             Text(deleteError ?? "")
+        }
+    }
+
+    // MARK: - Paging
+
+    /// The same paging idiom the For You feed uses, turned on its side.
+    ///
+    /// It replaced a paged `TabView`, which builds a page for every element of its
+    /// `ForEach` up front: opening a profile with a few hundred photos meant
+    /// constructing a few hundred image views before the first swipe could be
+    /// handled. A `LazyHStack` builds the page you are on and its neighbours.
+    private var pager: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 0) {
+                    ForEach(items) { item in
+                        MediaContentView(
+                            item: item,
+                            showOverlay: $showOverlay,
+                            isActive: item.id == currentID
+                        )
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(item.id)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollPosition(id: $currentID)
+            .scrollTargetBehavior(.paging)
+            .scrollIndicators(.hidden)
+            .ignoresSafeArea()
+            .onAppear {
+                // `scrollPosition` places the first page on its own, but only once
+                // the lazy stack has measured far enough to reach it. Tapping the
+                // 300th photo in a grid is exactly the case where it has not, and
+                // the viewer would open on the first photo instead.
+                jumpToInitialItem(proxy)
+                // Again after a turn of the run loop, for the presentation where
+                // the scroll view had no laid-out content to aim at the first time.
+                // A second jump to a page already showing is free.
+                Task { @MainActor in
+                    await Task.yield()
+                    jumpToInitialItem(proxy)
+                }
+            }
+        }
+    }
+
+    private func jumpToInitialItem(_ proxy: ScrollViewProxy) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo(initialItem.id, anchor: .center)
         }
     }
 
@@ -169,6 +222,18 @@ struct FullScreenMediaView: View {
     }
 
     // MARK: - Actions
+
+    /// Decodes the pages either side of this one into the image cache.
+    ///
+    /// Driven by the page the user is actually on rather than by each page's own
+    /// `onAppear`, so the work follows the swipe instead of whatever SwiftUI
+    /// happened to instantiate.
+    private func prefetchAroundCurrentPage() {
+        guard let index = items.firstIndex(where: { $0.id == currentID }) else { return }
+        let lower = max(items.startIndex, index - Self.prefetchRadius)
+        let upper = min(items.endIndex, index + Self.prefetchRadius + 1)
+        imageLoader.prefetchFullImages(for: Array(items[lower..<upper]))
+    }
 
     private func deleteCurrentItem() async {
         guard let item = currentItem,

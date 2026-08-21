@@ -17,7 +17,10 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
     /// the player's width.
     private static let skipZoneWidthFraction: CGFloat = 0.3
     private static let controlsHeight: CGFloat = 70
-    private static let controlsBottomInset: CGFloat = -60
+    /// Gap between the scrubber and the home indicator. The container ignores the
+    /// safe area so the video can be full-bleed, which also zeroes the container's
+    /// own safe-area guide — so the inset is read off the window instead.
+    private static let controlsBottomGap: CGFloat = 16
     private static let forwardBufferDuration: TimeInterval = 5
 
     func makeUIViewController(context: Context) -> UIViewController {
@@ -56,7 +59,7 @@ struct EnhancedVideoPlayerView: UIViewControllerRepresentable {
             controlsView.trailingAnchor.constraint(equalTo: container.view.trailingAnchor),
             controlsView.bottomAnchor.constraint(
                 equalTo: container.view.bottomAnchor,
-                constant: Self.controlsBottomInset
+                constant: -(ScreenInsets.bottom + Self.controlsBottomGap)
             ),
             controlsView.heightAnchor.constraint(equalToConstant: Self.controlsHeight)
         ])

@@ -9,6 +9,7 @@ struct SettingsTab: View {
 
     @AppStorage(StorageKey.flattenFolders) private var flattenFolders = true
     @State private var showFolderPicker = false
+    @State private var showRootPicker = false
     @State private var showRemoveConfirmation = false
     @State private var showLoginSheet = false
 
@@ -28,6 +29,9 @@ struct SettingsTab: View {
                 FolderPicker { url in
                     Task { await library.selectFolder(url) }
                 }
+            }
+            .sheet(isPresented: $showRootPicker) {
+                RemoteRootPicker()
             }
             .sheet(isPresented: $showLoginSheet) {
                 if let url = remote.baseURL {
@@ -92,6 +96,17 @@ struct SettingsTab: View {
 
                 if remote.isAuthenticated {
                     Button {
+                        showRootPicker = true
+                    } label: {
+                        LabeledContent {
+                            Text(Self.rootLabel(remote.libraryRootPath))
+                                .foregroundStyle(.secondary)
+                        } label: {
+                            Label("Library Root", systemImage: "folder")
+                        }
+                    }
+
+                    Button {
                         Task { await library.refresh() }
                     } label: {
                         Label("Refresh from Server", systemImage: "arrow.clockwise")
@@ -101,7 +116,7 @@ struct SettingsTab: View {
         } header: {
             Text("Remote Server")
         } footer: {
-            Text("Connect to a MediaVault server over the network, then sign in through the web page. A local address like 192.168.1.10:8000 is reached over HTTP; anything else uses HTTPS.")
+            Text("Connect to a MediaVault server over the network, then sign in through the web page. A local address like 192.168.1.10:8000 is reached over HTTP; anything else uses HTTPS. Library Root picks which folder on the server your profiles come from.")
         }
     }
 
@@ -225,6 +240,11 @@ struct SettingsTab: View {
         let version = info?["CFBundleShortVersionString"] as? String ?? "—"
         let build = info?["CFBundleVersion"] as? String
         return build.map { "\(version) (\($0))" } ?? version
+    }
+
+    /// Server-relative library root, as a row value.
+    private static func rootLabel(_ path: String) -> String {
+        path.isEmpty ? "Whole library" : path
     }
 
     private static func formatList(_ extensions: Set<String>) -> String {

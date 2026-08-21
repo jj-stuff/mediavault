@@ -17,6 +17,17 @@ final class RemoteServerService {
         didSet { store.write(serverURL, forKey: StorageKey.remoteServerURL) }
     }
 
+    /// Folder on the server — relative to *its* media root — that this app treats
+    /// as the library. Empty means the server's media root, which is what every
+    /// install had before this setting existed.
+    ///
+    /// It only changes which folders are read as profiles. Item paths, and so
+    /// likes and deletes, stay relative to the server's media root either way, so
+    /// switching between `peeps` and `peeps2` does not orphan anything.
+    var libraryRootPath: String {
+        didSet { store.write(libraryRootPath, forKey: StorageKey.remoteLibraryRoot) }
+    }
+
     private(set) var isAuthenticated = false
 
     private let store: KeyValueStore
@@ -27,6 +38,7 @@ final class RemoteServerService {
         self.urlSession = urlSession
         self.isEnabled = store.bool(forKey: StorageKey.remoteEnabled)
         self.serverURL = store.string(forKey: StorageKey.remoteServerURL) ?? ""
+        self.libraryRootPath = store.string(forKey: StorageKey.remoteLibraryRoot) ?? ""
     }
 
     // MARK: - URLs
@@ -81,6 +93,17 @@ final class RemoteServerService {
     /// against a local folder root.
     var filesBaseURL: URL? {
         baseURL?.appending(path: "api/files")
+    }
+
+    /// A library endpoint with the chosen root attached.
+    ///
+    /// The parameter is left off entirely when the root is the server's own media
+    /// root, so the requests an unconfigured app makes are byte-for-byte what they
+    /// were before, and an older server that ignores `root=` still answers them.
+    private func libraryURL(_ path: String, base: URL) -> URL {
+        let url = base.appending(path: path)
+        guard !libraryRootPath.isEmpty else { return url }
+        return url.appending(queryItems: [URLQueryItem(name: "root", value: libraryRootPath)])
     }
 
     // MARK: - Auth
@@ -148,7 +171,7 @@ final class RemoteServerService {
     func fetchProfiles() async throws -> [MediaProfile] {
         guard let base = baseURL else { throw RemoteError.notConfigured }
 
-        let listing: ProfilesResponse = try await get(base.appending(path: "api/profiles"))
+        let listing: ProfilesResponse = try await get(libraryURL("api/profiles", base: base))
 
         var profiles: [MediaProfile] = []
         profiles.reserveCapacity(listing.profiles.count)
@@ -168,7 +191,7 @@ final class RemoteServerService {
 
     private func buildProfile(dto: RemoteProfileDTO, baseURL: URL) async throws -> MediaProfile {
         let profileID = UUID()
-        let itemsURL = baseURL.appending(path: "api/profiles/\(dto.id)/items")
+        let itemsURL = libraryURL("api/profiles/\(dto.id)/items", base: baseURL)
         let response: ItemsResponse = try await get(itemsURL)
         let filesBase = baseURL.appending(path: "api/files")
 
@@ -181,17 +204,46 @@ final class RemoteServerService {
                 mediaType: type,
                 profileID: profileID,
                 profileName: dto.name,
-                subfolder: item.subfolder
+                subfolder: item.subfolder,
+                byteSize: item.byteSize,
+                // Seconds since the epoch on the wire: a JSON date format is one more
+                // thing for the two sides to disagree about.
+                modifiedAt: item.modifiedAt.map(Date.init(timeIntervalSince1970:))
             )
         }
 
         return MediaProfile(
             id: profileID,
             name: dto.name,
-            folderURL: filesBase.appending(path: dto.id),
+            // `path` rather than `id`: under a chosen library root a profile is
+            // `peeps/alice`, and only its last component is the id. Optional so a
+            // server older than the root setting still resolves to something.
+            folderURL: filesBase.appending(path: dto.path ?? dto.id),
             thumbnailURL: dto.thumbnailPath.map { baseURL.appending(path: "api/thumbnails/\($0)") },
             mediaItems: mediaItems,
             subfolders: dto.subfolders
+        )
+    }
+
+    // MARK: - Folder browsing
+
+    /// Lists the folders directly inside `path` on the server.
+    ///
+    /// Used by the library-root picker, and only there: browsing the tree is a
+    /// setup question, not something the library screens ever need.
+    func fetchFolders(at path: String) async throws -> RemoteFolderListing {
+        guard let base = baseURL else { throw RemoteError.notConfigured }
+
+        var url = base.appending(path: "api/folders")
+        if !path.isEmpty {
+            url = url.appending(queryItems: [URLQueryItem(name: "path", value: path)])
+        }
+
+        let response: FoldersResponse = try await get(url)
+        return RemoteFolderListing(
+            path: response.path,
+            parent: response.parent,
+            folders: response.folders
         )
     }
 
@@ -241,12 +293,21 @@ private struct ProfilesResponse: Decodable {
 }
 
 private struct RemoteProfileDTO: Decodable {
-    let id: String              // folder name used in URL paths, e.g. "alice"
+    let id: String              // folder name used to ask for this profile's items
     let name: String            // display name
     let imageCount: Int
     let videoCount: Int
     let subfolders: [String]
     let thumbnailPath: String?  // relative path, e.g. "alice/cover.jpg"
+    // Path relative to the server's media root, e.g. "peeps/alice". Optional so the
+    // app keeps working against a server that predates the library-root setting.
+    let path: String?
+}
+
+private struct FoldersResponse: Decodable {
+    let path: String
+    let parent: String?
+    let folders: [RemoteFolder]
 }
 
 private struct ItemsResponse: Decodable {
@@ -258,6 +319,32 @@ private struct RemoteItemDTO: Decodable {
     let mediaType: String       // "image" or "video"
     let subfolder: String?
     let path: String            // relative to the library root
+    let byteSize: Int64?        // size on disk
+    let modifiedAt: Double?     // seconds since the epoch
+}
+
+// MARK: - Folder listings
+
+/// One folder on the server, offered as a candidate library root.
+nonisolated struct RemoteFolder: Identifiable, Hashable, Sendable, Decodable {
+    let name: String
+    /// Relative to the server's media root, e.g. `peeps/alice`.
+    let path: String
+    /// Immediate subfolders, and media files directly inside. Between them the
+    /// picker can say whether a folder holds profiles or holds the photos itself.
+    let folderCount: Int
+    let itemCount: Int
+
+    var id: String { path }
+}
+
+nonisolated struct RemoteFolderListing: Sendable {
+    /// The folder that was listed. Empty at the server's media root.
+    let path: String
+    /// Parent of `path`, or `nil` at the top — supplied by the server so the picker
+    /// does not do path arithmetic of its own.
+    let parent: String?
+    let folders: [RemoteFolder]
 }
 
 // MARK: - Errors

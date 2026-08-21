@@ -2,20 +2,40 @@ import SwiftUI
 
 struct ProfilesTab: View {
     @Environment(MediaScannerService.self) private var scanner
+    @Environment(LibraryController.self) private var library
+
+    @AppStorage(StorageKey.profileSortOrder) private var sortRaw = SortOption.alphabetical.rawValue
     @State private var searchText = ""
-    @State private var sortOption: SortOption = .alphabetical
 
     private static let columns = [
         GridItem(.adaptive(minimum: 150), spacing: 12)
     ]
 
     enum SortOption: String, CaseIterable, Identifiable {
-        case alphabetical = "A-Z"
+        case alphabetical = "Name (A–Z)"
+        case reverseAlphabetical = "Name (Z–A)"
+        case newest = "Recently Updated"
+        case largest = "Largest on Disk"
         case mostContent = "Most Content"
         case mostImages = "Most Images"
         case mostVideos = "Most Videos"
 
         var id: Self { self }
+
+        var systemImage: String {
+            switch self {
+            case .alphabetical, .reverseAlphabetical: "textformat"
+            case .newest: "calendar"
+            case .largest: "internaldrive"
+            case .mostContent: "square.grid.2x2"
+            case .mostImages: "photo"
+            case .mostVideos: "video"
+            }
+        }
+    }
+
+    private var sortOption: SortOption {
+        SortOption(rawValue: sortRaw) ?? .alphabetical
     }
 
     private var filteredProfiles: [MediaProfile] {
@@ -25,15 +45,35 @@ struct ProfilesTab: View {
             result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
         }
 
+        // Every comparison falls back to the name so the order is total: without it,
+        // profiles that tie — and a library of same-sized folders ties constantly —
+        // reshuffle on each redraw.
+        func byName(_ lhs: MediaProfile, _ rhs: MediaProfile) -> Bool {
+            lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+
         switch sortOption {
         case .alphabetical:
-            result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            result.sort(by: byName)
+        case .reverseAlphabetical:
+            result.sort { byName($1, $0) }
+        case .newest:
+            result.sort {
+                let (a, b) = ($0.lastModified ?? .distantPast, $1.lastModified ?? .distantPast)
+                return a == b ? byName($0, $1) : a > b
+            }
+        case .largest:
+            result.sort {
+                $0.totalByteSize == $1.totalByteSize
+                    ? byName($0, $1)
+                    : $0.totalByteSize > $1.totalByteSize
+            }
         case .mostContent:
-            result.sort { $0.totalCount > $1.totalCount }
+            result.sort { $0.totalCount == $1.totalCount ? byName($0, $1) : $0.totalCount > $1.totalCount }
         case .mostImages:
-            result.sort { $0.imageCount > $1.imageCount }
+            result.sort { $0.imageCount == $1.imageCount ? byName($0, $1) : $0.imageCount > $1.imageCount }
         case .mostVideos:
-            result.sort { $0.videoCount > $1.videoCount }
+            result.sort { $0.videoCount == $1.videoCount ? byName($0, $1) : $0.videoCount > $1.videoCount }
         }
 
         return result
@@ -69,7 +109,7 @@ struct ProfilesTab: View {
                 ToolbarItem(placement: .topBarTrailing) { sortMenu }
             }
             .navigationDestination(for: MediaProfile.self) { profile in
-                ProfileDetailView(profile: profile)
+                ProfileDetailView(pushedProfile: profile)
             }
         }
     }
@@ -86,18 +126,21 @@ struct ProfilesTab: View {
             }
             .padding(.horizontal)
             .padding(.top, 8)
+            .padding(.bottom, ScreenInsets.gridBottomClearance)
         }
+        .refreshable { await library.refresh() }
     }
 
     private var sortMenu: some View {
         Menu {
-            Picker("Sort", selection: $sortOption) {
+            Picker("Sort", selection: $sortRaw) {
                 ForEach(SortOption.allCases) { option in
-                    Text(option.rawValue).tag(option)
+                    Label(option.rawValue, systemImage: option.systemImage).tag(option.rawValue)
                 }
             }
         } label: {
             Label("Sort", systemImage: "arrow.up.arrow.down")
         }
+        .accessibilityLabel("Sort, currently \(sortOption.rawValue)")
     }
 }

@@ -91,7 +91,7 @@ final class MediaScannerService {
         let fileManager = FileManager.default
         let contents = try fileManager.contentsOfDirectory(
             at: rootURL,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: scanKeys,
             options: [.skipsHiddenFiles]
         )
 
@@ -169,13 +169,22 @@ final class MediaScannerService {
         return items
     }
 
+    /// Resource keys pre-fetched with the directory listing.
+    ///
+    /// Asking for size and modification date here rather than per file is the
+    /// difference between one `readdir` and one `stat` per item: `contentsOfDirectory`
+    /// caches these on the returned URLs, so `makeItem` reads them for free.
+    nonisolated private static var scanKeys: [URLResourceKey] {
+        [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+    }
+
     nonisolated private static func contentsOf(
         _ url: URL,
         fileManager: FileManager
     ) -> (files: [URL], folders: [URL]) {
         guard let contents = try? fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: scanKeys,
             options: [.skipsHiddenFiles]
         ) else { return ([], []) }
 
@@ -192,6 +201,7 @@ final class MediaScannerService {
         subfolder: String?
     ) -> MediaItem? {
         guard let type = MediaItem.mediaType(for: url.pathExtension) else { return nil }
+        let values = try? url.resourceValues(forKeys: Set(scanKeys))
         return MediaItem(
             id: UUID(),
             url: url,
@@ -199,7 +209,9 @@ final class MediaScannerService {
             mediaType: type,
             profileID: profileID,
             profileName: profileName,
-            subfolder: subfolder
+            subfolder: subfolder,
+            byteSize: values?.fileSize.map(Int64.init),
+            modifiedAt: values?.contentModificationDate
         )
     }
 }

@@ -9,6 +9,40 @@ nonisolated struct MediaItem: Identifiable, Hashable, Sendable {
     let profileName: String
     let subfolder: String?
 
+    /// Size on disk in bytes, and last modification date.
+    ///
+    /// Optional because not every source can supply them: a like resolved back into
+    /// an item knows only its path, and a folder that has moved may no longer answer
+    /// for its files. Sorting treats a missing value as the oldest / smallest rather
+    /// than dropping the item, so nothing ever disappears from a grid because its
+    /// metadata could not be read.
+    let byteSize: Int64?
+    let modifiedAt: Date?
+
+    // Written out rather than left to the memberwise initialiser so the two metadata
+    // fields can default: most call sites genuinely do not have them.
+    init(
+        id: UUID = UUID(),
+        url: URL,
+        fileName: String,
+        mediaType: MediaItemType,
+        profileID: UUID,
+        profileName: String,
+        subfolder: String?,
+        byteSize: Int64? = nil,
+        modifiedAt: Date? = nil
+    ) {
+        self.id = id
+        self.url = url
+        self.fileName = fileName
+        self.mediaType = mediaType
+        self.profileID = profileID
+        self.profileName = profileName
+        self.subfolder = subfolder
+        self.byteSize = byteSize
+        self.modifiedAt = modifiedAt
+    }
+
     var fileExtension: String {
         url.pathExtension.lowercased()
     }
