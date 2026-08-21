@@ -25,6 +25,21 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 # so it never shows up as a profile.
 TRASH_DIR_NAME = "Trash"
 
+# How DELETE /api/media/{path} disposes of a file.
+#
+#   trash      always move into the trash; fail loudly if that is not possible
+#   permanent  always unlink
+#   auto       move into the trash, and unlink instead when the trash cannot be
+#              created or written
+#
+# `auto` is the default because the failure it covers is invisible until you try to
+# delete something: a media root bind-mounted read-only, or owned by a different uid
+# than the container runs as, cannot have a Trash folder created inside it. That
+# surfaced as a 500 with a PermissionError buried in a 40-line traceback, on a button
+# the user had already confirmed twice.
+DELETE_MODES = frozenset({"trash", "permanent", "auto"})
+DEFAULT_DELETE_MODE = "auto"
+
 
 def _fail(*lines: str) -> NoReturn:
     """Prints a readable startup failure and exits.
@@ -76,6 +91,8 @@ class Settings:
     #: it would be destroyed the next time the container is recreated — turning
     #: "move to Trash" into a permanent delete.
     trash_dir: Path | None = None
+    #: One of `DELETE_MODES`. See the constant for what each one does.
+    delete_mode: str = DEFAULT_DELETE_MODE
 
     @property
     def trash_root(self) -> Path:
@@ -112,9 +129,18 @@ class Settings:
 
         trash_raw = os.environ.get("MEDIAVAULT_TRASH_DIR", "").strip()
 
+        delete_mode = os.environ.get("MEDIAVAULT_DELETE_MODE", "").strip().lower()
+        if delete_mode and delete_mode not in DELETE_MODES:
+            print(
+                f"[mediavault] WARNING: MEDIAVAULT_DELETE_MODE={delete_mode!r} is not "
+                f"one of {sorted(DELETE_MODES)}; using {DEFAULT_DELETE_MODE!r}."
+            )
+            delete_mode = ""
+
         return cls(
             media_root=_env_path("MEDIAVAULT_MEDIA_ROOT", "/media"),
             trash_dir=Path(trash_raw).expanduser() if trash_raw else None,
+            delete_mode=delete_mode or DEFAULT_DELETE_MODE,
             password=password,
             secret_key=secret_key,
             thumb_cache_dir=_env_path("MEDIAVAULT_THUMB_CACHE", "/cache/thumbs"),

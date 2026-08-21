@@ -168,6 +168,23 @@ The trash is deliberately kept off `/media`. In the several-folders setup above,
 trash folder inside it would be destroyed the next time the container is recreated,
 turning every "move to Trash" into a permanent delete.
 
+### When the trash cannot be written
+
+A media root that is bind-mounted read-only, or owned by a different uid than the
+container runs as, cannot have a `Trash` folder created inside it. `mkdir` raises
+`PermissionError`, and every delete used to come back as a bare 500 with the real
+reason buried in a traceback — on a button the user had already confirmed twice.
+
+`MEDIAVAULT_DELETE_MODE` decides what happens instead:
+
+| Mode | Behaviour |
+| --- | --- |
+| `auto` (default) | Move to the trash; delete outright if that is not possible, and log why. |
+| `trash` | Move to the trash, or fail with a message naming the fix. Nothing is ever destroyed silently. |
+| `permanent` | Always delete outright. Fastest to reason about, and nothing is recoverable. |
+
+The response body says which happened, so `auto` is not a silent substitution.
+
 The server prints its trash location on every boot. Check it in `docker compose logs`
 before you rely on deletes.
 
@@ -201,6 +218,7 @@ in the clear, and it is the only thing protecting your library.
 | `MEDIAVAULT_PORT` | `8000` | Host port. The container always listens on 8000 inside. |
 | `MEDIAVAULT_MEDIA_DIR` | — | Host path to your library, mounted at `/media`. |
 | `MEDIAVAULT_TRASH_DIR` | named volume | Where deletes go. A host path keeps them browsable. |
+| `MEDIAVAULT_DELETE_MODE` | `auto` | `trash`, `permanent`, or `auto` — see below. |
 | `MEDIAVAULT_MEDIA_ROOT` | `/media` | Library path *inside* the container. |
 | `MEDIAVAULT_THUMB_CACHE` | `/cache/thumbs` | Thumbnail cache path inside the container. |
 | `MEDIAVAULT_SESSION_MAX_AGE` | `2592000` | Session lifetime in seconds (30 days). |
@@ -220,14 +238,27 @@ response shape means changing the client too.
 | `POST` | `/login` | Sets the session cookie |
 | `POST` | `/logout` | Clears it |
 | `GET` | `/api/auth/check` | `200` when signed in, `401` otherwise |
-| `GET` | `/api/profiles` | `{"profiles": [{id, name, imageCount, videoCount, subfolders, thumbnailPath}]}` |
-| `POST` | `/api/profiles/refresh` | Same, forcing a rescan |
-| `GET` | `/api/profiles/{id}/items` | `{"items": [{fileName, mediaType, subfolder, path}]}` |
+| `GET` | `/api/folders?path=` | `{"path", "parent", "folders": [{name, path, folderCount, itemCount}]}` — subfolders of one folder, for picking a library root |
+| `GET` | `/api/profiles?root=` | `{"profiles": [{id, name, path, imageCount, videoCount, subfolders, thumbnailPath}]}` |
+| `POST` | `/api/profiles/refresh?root=` | Same, forcing a rescan |
+| `GET` | `/api/profiles/{id}/items?root=` | `{"items": [{fileName, mediaType, subfolder, path}]}` |
 | `GET`/`HEAD` | `/api/files/{path}` | Raw media. Honours `Range`, so video seeks. |
 | `GET`/`HEAD` | `/api/thumbnails/{path}` | Cached JPEG thumbnail |
-| `DELETE` | `/api/media/{path}` | Moves the file to `Trash/`, preserving its subpath |
+| `DELETE` | `/api/media/{path}` | Moves the file to `Trash/`, preserving its subpath. Replies `{"status": "trashed"}`, or `{"status": "deleted"}` when it had to delete outright |
 
 Paths are relative to the media root, e.g. `/api/files/alice/beach/swim.jpg`.
+
+### Library roots
+
+The media root is often a shelf rather than a library: `/media` holding `peeps` and
+`peeps2`, each of which is the thing you actually want to browse. `root=` says which
+folder to read profiles from, and the app sets it from **Settings → Library Root**.
+It is a client choice, not a server setting — two phones can pick different ones.
+
+Item paths stay relative to the *media* root whatever `root=` says, so `/api/files`,
+`/api/thumbnails`, `DELETE /api/media`, and the likes the app stores all mean the
+same thing before and after the choice changes. A `root=` that is missing, or that
+escapes the media root, is a `404` rather than an empty library.
 
 ### Notes
 
@@ -235,8 +266,9 @@ Paths are relative to the media root, e.g. `/api/files/alice/beach/swim.jpg`.
   containers will not play at all, without `206` responses.
 - **Deletes are moves, not unlinks.** A file goes to `Trash/<original/sub/path>`; a
   name collision gets a UTC timestamp suffix rather than overwriting.
-- **The library scan is cached** for `MEDIAVAULT_SCAN_CACHE_TTL` seconds. Deletes
-  invalidate it immediately; `POST /api/profiles/refresh` forces a rescan.
+- **The library scan is cached** for `MEDIAVAULT_SCAN_CACHE_TTL` seconds, per
+  `root=`, up to a handful of roots. Deletes invalidate every one of them;
+  `POST /api/profiles/refresh` forces a rescan of the root it is given.
 - **Thumbnails are keyed on path + mtime + size**, so replacing a file on disk
   regenerates its thumbnail with no cache-busting needed.
 
